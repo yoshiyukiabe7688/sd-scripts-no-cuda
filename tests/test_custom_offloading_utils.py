@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -113,7 +115,9 @@ def test_swap_weight_devices_cuda():
 
 @patch('library.custom_offloading_utils._synchronize_device')
 def test_swap_weight_devices_no_cuda(mock_sync_device):
-    device = torch.device('cpu')
+    # Stand-in for a non-CUDA accelerator (xpu / mps); transfers are mocked below, so no real device is needed.
+    # (A CPU compute device is a no-op by design; see test_swap_weight_devices_no_cuda_on_cpu_keeps_both_blocks_intact.)
+    device = torch.device('xpu')
     layer_to_cpu = SimpleModel()
     layer_to_cuda = SimpleModel()
     
@@ -337,9 +341,15 @@ def test_submit_move_blocks(mock_submit, model_offloader):
 
 
 # Integration test for offloading in a realistic scenario
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_offloading_integration():
-    device = torch.device('cuda')
+@pytest.mark.parametrize(
+    "device_name",
+    [
+        "cpu",  # CUDA なしの経路（swap_weight_devices_no_cuda）が CPU 上でも壊れていないことを確認する
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")),
+    ],
+)
+def test_offloading_integration(device_name):
+    device = torch.device(device_name)
     # Create a mini model with 4 blocks
     model = SimpleModel(5)
     model.to(device)
@@ -373,6 +383,43 @@ def test_offloading_integration():
     # Verify we get a valid output
     assert x.shape == (1, 10)
     assert not torch.isnan(x).any()
+
+
+# Regression tests: on a CPU compute device `.to("cpu")` returns the same tensor (no copy), so a naive swap
+# aliased two blocks onto one storage and silently corrupted the weights (training diverged after the first swap).
+def test_swap_weight_devices_no_cuda_on_cpu_keeps_both_blocks_intact():
+    torch.manual_seed(0)
+    block_a, block_b = TransformerBlock(0), TransformerBlock(1)
+    expected_a = {k: v.clone() for k, v in block_a.state_dict().items()}
+    expected_b = {k: v.clone() for k, v in block_b.state_dict().items()}
+
+    swap_weight_devices_no_cuda(torch.device("cpu"), block_a, block_b)
+
+    for name, param in block_a.state_dict().items():
+        assert torch.equal(param, expected_a[name]), f"block_a.{name} was modified"
+    for name, param in block_b.state_dict().items():
+        assert torch.equal(param, expected_b[name]), f"block_b.{name} was modified"
+    for pa, pb in zip(block_a.parameters(), block_b.parameters()):
+        assert pa.data_ptr() != pb.data_ptr(), "the two blocks must not share storage"
+
+
+def test_offloading_on_cpu_matches_resident_reference_over_multiple_passes():
+    torch.manual_seed(0)
+    model = SimpleModel(6)
+    reference = copy.deepcopy(model)
+    blocks = model.blocks
+    offloader = ModelOffloader(blocks=blocks, blocks_to_swap=3, device=torch.device("cpu"))
+    offloader.prepare_block_devices_before_forward(blocks)
+
+    for _ in range(3):  # the corruption only showed up from the second pass on
+        x = torch.randn(2, 10)
+        expected = reference(x)
+        out = x
+        for i, block in enumerate(blocks):
+            offloader.wait_for_block(i)
+            out = block(out)
+            offloader.submit_move_blocks_forward(blocks, i)
+        assert torch.allclose(out, expected, atol=1e-6), "offloaded forward must equal the fully resident model"
 
 
 # Error handling tests

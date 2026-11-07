@@ -9,6 +9,15 @@ from typing import Any, Optional, Union, Callable, Tuple
 import torch
 import torch.nn as nn
 
+from library.utils import setup_logging
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+_warned_block_swap_on_cpu = False  # warn only once even if several block groups create offloaders
+
 
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
 def _clean_memory_on_device(device: torch.device):
@@ -81,9 +90,16 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
     """
-    not tested
+    Swap block weights between the compute device and the CPU for non-CUDA accelerators (xpu / mps).
+
+    When the compute device is the CPU itself there is nothing to swap: both blocks already live in host memory,
+    and `tensor.to("cpu")` would return the very same tensor (no copy), so swapping would alias the two blocks onto
+    one storage and silently corrupt their weights. In that case this function does nothing.
     """
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+
+    if device.type == "cpu":
+        return
 
     weight_swap_jobs: list[Tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor]] = []
     for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
@@ -359,7 +375,24 @@ def create_offloader(block_type: str, blocks: list[nn.Module], num_blocks: int, 
     implementation from ``config``; ``enable_block_swap`` only supplies the per-block-list arguments, so a new
     offloader type plugs in here without touching any architecture.
     """
-    if config.h2d_only:
+    global _warned_block_swap_on_cpu
+    if config.device.type == "cpu" and not _warned_block_swap_on_cpu:
+        _warned_block_swap_on_cpu = True
+        logger.warning(
+            "Block swap has no effect on a CPU compute device (all blocks already live in host memory); weights are left in place."
+            " / 計算デバイスが CPU の場合、ブロックスワップは効果がありません（全ブロックが既にホストメモリ上にあります）。重みはそのまま保持されます。"
+        )
+
+    use_h2d_only = config.h2d_only
+    if use_h2d_only and config.device.type != "cuda":
+        # H2D-only streaming relies on CUDA streams/events; other devices use the generic block swap instead.
+        logger.warning(
+            f"--block_swap_h2d_only is CUDA-only; falling back to the generic block swap on device '{config.device.type}'."
+            f" / --block_swap_h2d_only は CUDA 専用のため、デバイス '{config.device.type}' では通常のブロックスワップを使用します。"
+        )
+        use_h2d_only = False
+
+    if use_h2d_only:
         # H2D-only streaming for frozen-base (LoRA) training: keep a CPU master, copy Host->Device only.
         return LoRAStreamOffloader(
             block_type,
