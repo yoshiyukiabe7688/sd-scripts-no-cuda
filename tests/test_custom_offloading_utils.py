@@ -282,22 +282,43 @@ def test_backward_hook_execution(mock_wait, mock_submit):
     assert mock_wait.call_count == 2
 
 
+@patch('library.custom_offloading_utils.to_device_keeping_weights_on_cpu')
 @patch('library.custom_offloading_utils.weighs_to_device')
 @patch('library.custom_offloading_utils._synchronize_device')
 @patch('library.custom_offloading_utils._clean_memory_on_device')
-def test_prepare_block_devices_before_forward(mock_clean, mock_sync, mock_weights_to_device, model_offloader):
+def test_prepare_block_devices_before_forward(mock_clean, mock_sync, mock_weights_to_device, mock_keep_on_cpu, model_offloader):
     model = SimpleModel(4)
     blocks = model.blocks
-    
+
     with patch.object(nn.Module, 'to'):
         model_offloader.prepare_block_devices_before_forward(blocks)
-        
-        # Check that weighs_to_device was called for each block
-        assert mock_weights_to_device.call_count == 4
-        
+
+        if model_offloader.device.type == "cuda":
+            # CUDA: 従来どおり、全ブロックで weighs_to_device
+            assert mock_weights_to_device.call_count == 4
+            mock_keep_on_cpu.assert_not_called()
+        else:
+            # 非 CUDA: 常駐ブロック(2)だけ weighs_to_device。スワップ対象(2)は重みを載せずに移す
+            assert mock_weights_to_device.call_count == 2
+            assert mock_keep_on_cpu.call_count == 2
+
         # Check that _synchronize_device and _clean_memory_on_device were called
         mock_sync.assert_called_once_with(model_offloader.device)
         mock_clean.assert_called_once_with(model_offloader.device)
+
+
+@patch('library.custom_offloading_utils.to_device_keeping_weights_on_cpu')
+@patch('library.custom_offloading_utils.weighs_to_device')
+@patch('library.custom_offloading_utils._synchronize_device')
+@patch('library.custom_offloading_utils._clean_memory_on_device')
+def test_prepare_block_devices_before_forward_cuda_path_is_unchanged(mock_clean, mock_sync, mock_weights_to_device, mock_keep_on_cpu, model_offloader):
+    # CUDA が無い環境でも、デバイス型だけを cuda にして経路を確認する（実際の転送は mock）
+    model = SimpleModel(4)
+    model_offloader.device = torch.device("cuda")
+    with patch.object(nn.Module, 'to'):
+        model_offloader.prepare_block_devices_before_forward(model.blocks)
+    assert mock_weights_to_device.call_count == 4
+    mock_keep_on_cpu.assert_not_called()
 
 
 @patch('library.custom_offloading_utils.ModelOffloader._wait_blocks_move')
