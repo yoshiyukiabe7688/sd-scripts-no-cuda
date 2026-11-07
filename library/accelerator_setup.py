@@ -121,13 +121,13 @@ def prepare_accelerator(args: argparse.Namespace):
     kwargs_handlers = [
         (
             InitProcessGroupKwargs(
-                backend="gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
+                backend=device_utils.get_ddp_backend(),
                 init_method=(
                     "env://?use_libuv=False" if os.name == "nt" and Version(torch.__version__) >= Version("2.4.0") else None
                 ),
                 timeout=datetime.timedelta(minutes=args.ddp_timeout) if args.ddp_timeout else None,
             )
-            if torch.cuda.device_count() > 1
+            if device_utils.get_accelerator_count() > 1
             else None
         ),
         (

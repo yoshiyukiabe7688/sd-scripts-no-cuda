@@ -210,3 +210,21 @@ def test_override_accelerator_device_sets_state_device(clean_external_backend, m
         assert acc.device == torch.device("meta")
     finally:
         AcceleratorState._reset_state(reset_partial_state=True)
+
+
+def test_get_ddp_backend_is_gloo_without_cuda(monkeypatch):
+    monkeypatch.setattr(device_utils, "HAS_CUDA", False)
+    assert device_utils.get_ddp_backend() == "gloo"
+
+
+def test_get_accelerator_count_sums_registered_backends(monkeypatch):
+    import types
+
+    base = device_utils.get_accelerator_count()
+    fake = types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 2)
+    monkeypatch.setattr(torch, "fakedev", fake, raising=False)
+    monkeypatch.setattr(device_utils, "_ACCELERATOR_BACKENDS", [*device_utils._ACCELERATOR_BACKENDS, "fakedev"])
+    assert device_utils.get_accelerator_count() == base + 2
+    # device_count を持たないバックエンドは 1 台として数える
+    monkeypatch.setattr(torch, "fakedev", types.SimpleNamespace(is_available=lambda: True), raising=False)
+    assert device_utils.get_accelerator_count() == base + 1

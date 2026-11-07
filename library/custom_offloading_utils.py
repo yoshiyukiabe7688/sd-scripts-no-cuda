@@ -88,6 +88,26 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
 
+def _pair_modules(layer_a: nn.Module, layer_b: nn.Module) -> list[Tuple[nn.Module, nn.Module]]:
+    """
+    Pair up the submodules of two blocks of the same class by name.
+
+    Pairing by `zip(a.modules(), b.modules())` silently mismatches weights when the two blocks have the same class but a
+    different set of submodules (e.g. a block whose optional layers are absent, as in the last block of some models).
+    Raise instead of swapping the wrong weights.
+    """
+    modules_a = dict(layer_a.named_modules())
+    modules_b = dict(layer_b.named_modules())
+    if modules_a.keys() != modules_b.keys():
+        only_a = sorted(modules_a.keys() - modules_b.keys())[:5]
+        only_b = sorted(modules_b.keys() - modules_a.keys())[:5]
+        raise ValueError(
+            "Cannot swap weights between blocks with different structures "
+            f"(only in the first: {only_a}, only in the second: {only_b}) / 構造の異なるブロック間では重みをスワップできません"
+        )
+    return [(modules_a[name], modules_b[name]) for name in modules_a]
+
+
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
     """
     Swap block weights between the compute device and the CPU for non-CUDA accelerators (xpu / mps).
@@ -102,7 +122,7 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
         return
 
     weight_swap_jobs: list[Tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor]] = []
-    for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
+    for module_to_cpu, module_to_cuda in _pair_modules(layer_to_cpu, layer_to_cuda):
         if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
             weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
@@ -1088,10 +1108,13 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
     """
 
     @staticmethod
-    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, forward_function, hidden_states, *args):
         # Remember the original device for backward pass (multi-GPU support)
         ctx.input_device = hidden_states.device
+        # Remember the autocast state of the input device so that backward recomputes under the same autocast.
+        # (`torch.amp.custom_fwd/custom_bwd` only handle one hard-coded device type, so they cannot do this for cpu / xpu / vk.)
+        ctx.autocast_enabled = torch.is_autocast_enabled(hidden_states.device.type)
+        ctx.autocast_dtype = torch.get_autocast_dtype(hidden_states.device.type)
         saved_hidden_states = hidden_states.to("cpu", non_blocking=True)
         with torch.no_grad():
             output = forward_function(hidden_states, *args)
@@ -1104,14 +1127,15 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
         return output
 
     @staticmethod
-    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, *grads):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.to(ctx.input_device, non_blocking=True).detach()
         hidden_states.requires_grad_(True)
         args = detach_variable(ctx.args)
         inputs = (hidden_states,) + args
-        with torch.enable_grad():
+        with torch.enable_grad(), torch.autocast(
+            device_type=ctx.input_device.type, dtype=ctx.autocast_dtype, enabled=ctx.autocast_enabled
+        ):
             outputs = ctx.forward_function(*inputs)
 
         output_tensors = []

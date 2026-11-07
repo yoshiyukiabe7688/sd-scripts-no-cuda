@@ -107,6 +107,28 @@ def _available_accelerator_modules():
             continue
 
 
+def get_accelerator_count() -> int:
+    r"""
+    利用可能なアクセラレータ（cuda / xpu / vk など、`_ACCELERATOR_BACKENDS` のうち使えるもの）の合計デバイス数。CPU のみなら 0。
+    Number of visible accelerator devices over all available backends. 0 when only the CPU is available.
+    """
+    total = 0
+    for _, module in _available_accelerator_modules():
+        try:
+            total += int(module.device_count())
+        except Exception:
+            total += 1  # device_count を持たないバックエンド（mps など）は 1 台として数える
+    return total
+
+
+def get_ddp_backend() -> str:
+    r"""
+    分散学習（DDP）のプロセスグループのバックエンド。nccl は Windows 以外の CUDA だけで、それ以外（CPU・xpu・mps・vk など）は gloo。
+    Process group backend for DDP: "nccl" only for CUDA on non-Windows, "gloo" otherwise.
+    """
+    return "nccl" if HAS_CUDA and os.name != "nt" else "gloo"
+
+
 def empty_cache():
     r"""利用可能な全アクセラレータのキャッシュを解放する（gc.collect は呼ばない）。"""
     for _, module in _available_accelerator_modules():
