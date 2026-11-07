@@ -29,14 +29,96 @@ except Exception:
     HAS_XPU = False
 
 
+# torch.<name> モジュール（get_rng_state / set_rng_state / manual_seed / seed / empty_cache を持つ）を提供する
+# アクセラレータの名前。CUDA 以外のデバイス（将来の vulkan など）は register_accelerator_backend で追加する。
+_ACCELERATOR_BACKENDS = ["cuda", "xpu", "mps"]
+
+
+def register_accelerator_backend(name: str):
+    r"""
+    `torch.<name>` モジュールを持つデバイスバックエンドを、乱数状態・シード・キャッシュ解放の対象に追加する。
+    Add a device backend (`torch.<name>` module) to the targets of the RNG / seed / cache helpers below.
+    """
+    if name not in _ACCELERATOR_BACKENDS:
+        _ACCELERATOR_BACKENDS.append(name)
+
+
+def _available_accelerator_modules():
+    r"""利用可能なアクセラレータの (名前, torch.<name> モジュール) を列挙する。"""
+    for name in _ACCELERATOR_BACKENDS:
+        module = getattr(torch, name, None)
+        if module is None:
+            continue
+        try:
+            # torch.mps には is_available() が無いので torch.backends.mps で判定する
+            available = torch.backends.mps.is_available() if name == "mps" else module.is_available()
+            if available:
+                yield name, module
+        except Exception:
+            continue
+
+
+def empty_cache():
+    r"""利用可能な全アクセラレータのキャッシュを解放する（gc.collect は呼ばない）。"""
+    for _, module in _available_accelerator_modules():
+        try:
+            module.empty_cache()
+        except Exception:
+            pass
+
+
 def clean_memory():
     gc.collect()
-    if HAS_CUDA:
-        torch.cuda.empty_cache()
-    if HAS_XPU:
-        torch.xpu.empty_cache()
-    if HAS_MPS:
-        torch.mps.empty_cache()
+    empty_cache()
+
+
+def get_rng_states() -> dict:
+    r"""
+    CPU と、利用可能な全アクセラレータの乱数状態を取得する。サンプル画像生成の前後で学習の乱数列を保つために使う。
+    Get RNG states of the CPU and all available accelerators. Pass the result to `set_rng_states` to restore.
+    """
+    states = {"cpu": torch.get_rng_state()}
+    for name, module in _available_accelerator_modules():
+        try:
+            states[name] = module.get_rng_state()
+        except Exception:
+            pass
+    return states
+
+
+def set_rng_states(states: dict):
+    r"""`get_rng_states` で取得した乱数状態を復元する。取得時に無かった・今は使えないデバイスは無視する。"""
+    if "cpu" in states:
+        torch.set_rng_state(states["cpu"])
+    for name, module in _available_accelerator_modules():
+        if name in states:
+            try:
+                module.set_rng_state(states[name])
+            except Exception:
+                pass
+
+
+def manual_seed_all(seed: int):
+    r"""CPU と、利用可能な全アクセラレータの乱数シードを固定する。"""
+    torch.manual_seed(seed)
+    for _, module in _available_accelerator_modules():
+        try:
+            if hasattr(module, "manual_seed_all"):
+                module.manual_seed_all(seed)
+            else:
+                module.manual_seed(seed)
+        except Exception:
+            pass
+
+
+def random_seed():
+    r"""CPU と、利用可能な全アクセラレータの乱数シードを非決定的な値にする（`torch.seed()` 相当）。"""
+    torch.seed()
+    for _, module in _available_accelerator_modules():
+        try:
+            module.seed()
+        except Exception:
+            pass
 
 
 def clean_memory_on_device(device: Optional[Union[str, torch.device]]):

@@ -512,12 +512,7 @@ def sample_images(
     os.makedirs(save_dir, exist_ok=True)
 
     # Save RNG state
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    try:
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    except Exception:
-        pass
+    rng_states = device_utils.get_rng_states()
 
     def _run_one(prompt_dict):
         dit.prepare_block_swap_before_forward()
@@ -559,9 +554,7 @@ def sample_images(
                     _run_one(prompt_dict)
 
     # Restore RNG state
-    torch.set_rng_state(rng_state)
-    if cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state)
+    device_utils.set_rng_states(rng_states)
 
     dit.switch_block_swap_for_training()
     clean_memory_on_device(accelerator.device)
@@ -598,8 +591,7 @@ def _sample_image_inference(
             negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
     if seed is not None:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # seed all CUDA devices for multi-GPU
+        device_utils.manual_seed_all(seed)
 
     height = max(64, height - height % 16)
     width = max(64, width - width % 16)

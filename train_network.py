@@ -17,6 +17,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.types import Number
+from library import device_utils
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -1543,33 +1544,18 @@ class NetworkTrainer:
         original_args_min_timestep = args.min_timestep
         original_args_max_timestep = args.max_timestep
 
-        def switch_rng_state(seed: int) -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
-            cpu_rng_state = torch.get_rng_state()
-            if accelerator.device.type == "cuda":
-                gpu_rng_state = torch.cuda.get_rng_state()
-            elif accelerator.device.type == "xpu":
-                gpu_rng_state = torch.xpu.get_rng_state()
-            elif accelerator.device.type == "mps":
-                gpu_rng_state = torch.cuda.get_rng_state()
-            else:
-                gpu_rng_state = None
+        def switch_rng_state(seed: int) -> tuple[dict, tuple]:
+            device_rng_states = device_utils.get_rng_states()
             python_rng_state = random.getstate()
 
             torch.manual_seed(seed)
             random.seed(seed)
 
-            return (cpu_rng_state, gpu_rng_state, python_rng_state)
+            return (device_rng_states, python_rng_state)
 
-        def restore_rng_state(rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]):
-            cpu_rng_state, gpu_rng_state, python_rng_state = rng_states
-            torch.set_rng_state(cpu_rng_state)
-            if gpu_rng_state is not None:
-                if accelerator.device.type == "cuda":
-                    torch.cuda.set_rng_state(gpu_rng_state)
-                elif accelerator.device.type == "xpu":
-                    torch.xpu.set_rng_state(gpu_rng_state)
-                elif accelerator.device.type == "mps":
-                    torch.cuda.set_rng_state(gpu_rng_state)
+        def restore_rng_state(rng_states: tuple[dict, tuple]):
+            device_rng_states, python_rng_state = rng_states
+            device_utils.set_rng_states(device_rng_states)
             random.setstate(python_rng_state)
 
         for epoch in range(epoch_to_start, num_train_epochs):

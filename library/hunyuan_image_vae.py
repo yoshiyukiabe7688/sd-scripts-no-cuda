@@ -7,6 +7,7 @@ from torch import Tensor, nn
 from torch.nn import Conv2d
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
+from library import device_utils
 from library.safetensors_utils import load_safetensors
 from library.utils import setup_logging
 
@@ -92,8 +93,7 @@ class ChunkedConv2d(nn.Conv2d):
             self.padding = self.original_padding
             x = super().forward(x)
             self.padding = (0, 0)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            device_utils.empty_cache()
             return x
 
         # Process input in chunks to reduce memory usage
@@ -138,8 +138,7 @@ class ChunkedConv2d(nn.Conv2d):
 
         assert yi == org_shape[2], f"yi={yi}, org_shape[2]={org_shape[2]}"
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # This helps reduce peak memory usage, but slows down a bit
+        device_utils.empty_cache()  # This helps reduce peak memory usage, but slows down a bit
         return y
 
 

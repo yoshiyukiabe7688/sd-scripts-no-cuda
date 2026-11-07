@@ -30,6 +30,7 @@ import numpy as np
 
 from library.safetensors_utils import load_safetensors
 
+from library import device_utils
 from library.utils import setup_logging
 
 setup_logging()
@@ -1658,11 +1659,16 @@ if __name__ == "__main__":
     parser.add_argument("--input_image_dir", type=str, required=True, help="Path to the input image directory.")
     parser.add_argument("--output_image_dir", type=str, required=True, help="Path to the output image directory.")
     parser.add_argument("--qwen_image_vae_2d", action="store_true", help="Whether to use the 2D version of the Qwen Image VAE.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to run the VAE on (e.g., 'cpu', 'cuda', 'cuda:0').")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to run the VAE on (e.g., 'cpu', 'cuda', 'cuda:0'). Default: the preferred available device / 既定: 利用可能な最優先デバイス",
+    )
     args = parser.parse_args()
 
     # Load VAE
-    device = torch.device(args.device)
+    device = torch.device(args.device) if args.device else device_utils.get_preferred_device()
     if args.qwen_image_vae_2d:
         print("Using Qwen Image VAE 2D version")
         vae = load_vae_2d(args.vae, device=device)

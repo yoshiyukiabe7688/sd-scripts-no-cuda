@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
-from library import utils
+from library import device_utils, utils
 from library.device_utils import clean_memory_on_device, init_ipex
 
 init_ipex()
@@ -483,8 +483,9 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tenso
 
 
 def to_cuda(x):
+    """Move tensors (nested in list/tuple/dict) to the preferred accelerator device (the name is kept for backward compatibility)."""
     if isinstance(x, torch.Tensor):
-        return x.cuda()
+        return x.to(device_utils.get_preferred_device())
     elif isinstance(x, (list, tuple)):
         return [to_cuda(elem) for elem in x]
     elif isinstance(x, dict):
