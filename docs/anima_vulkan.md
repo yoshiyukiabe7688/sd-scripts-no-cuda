@@ -10,9 +10,14 @@ CPU のみでも学習できます（環境変数なし。bf16 で約 10 秒/ste
 - Anima-base v1.0 と Anima-Turbo v1.1 の LoRA 学習（512px、batch 1、bf16、rank 16）: **約 1.4 秒/step**（CPU bf16 の約 7 倍）。
 - 学習した LoRA を **stable-diffusion.cpp**（master-1053-5a1ba5d、Vulkan ビルド）で読み込んで生成できることを確認済み（840/840 テンソルが適用）。
   オリジナルキャラクター（銀髪ツインテール・赤いリボン・青い目）を 12 枚で学習し、トリガーワード付きの未学習の場面で、LoRA ありはキャラクターが再現され、なしでは再現されない。base と Turbo の両方で確認。
+- Linux（Ubuntu、Mesa RADV）/ **Radeon RX 550 4GB**（Polaris。fp16 演算・協調行列なし）: Anima-base の LoRA 学習（384px、300 step、`--blocks_to_swap 24`）が完走し、
+  生成した人物 LoRA でも同様にキャラクターが再現されることを確認（詳細は「古い GPU 向けの調整」）。
+- **実機で確認したのは上の 2 機種だけ**です。それ以外の GPU（NVIDIA を含む）は未検証です。
 
 ## 必要なもの
-- Vulkan 対応 GPU とドライバ。協調行列（`VK_KHR_cooperative_matrix`）があると行列積が速くなる（無ければ自動でタイル型 GEMM に切り替わる）。
+- Vulkan 対応 GPU とドライバ。次の機能が必須です（無いデバイスでは起動時に、足りない機能名つきのエラーになります）:
+  `bufferDeviceAddress`、`shaderInt64`、`shaderInt16`、`shaderInt8`、`storageBuffer8BitAccess`、`storageBuffer16BitAccess`。
+  fp16 演算（`shaderFloat16`）と協調行列（`VK_KHR_cooperative_matrix`）は任意です。協調行列があると行列積が速くなります（無ければ自動でタイル型 GEMM に切り替わる）。
 - `torch-vulkan` のビルド: Visual Studio 2022（MSVC）、Rust（cargo）、Vulkan SDK（シェーダを再生成する場合のみ。生成済み SPIR-V はコミット済み）。
 - `torch-vulkan` は sd-scripts とは別リポジトリです。<https://github.com/yoshiyukiabe7688/torch-vulkan> を任意の場所に clone してください（例: `C:\Users\<you>\dev\torch-vulkan`）。
 
@@ -111,7 +116,7 @@ Anima の DiT は画像をトークンに分割して処理するので、トー
 `--max_train_steps` で自由に調整できます。時間が足りないときは、step 数を減らすより先に解像度を下げてください。
 
 ### 必須の設定
-- **`--blocks_to_swap 24` を付ける。** Anima の重み（約 4GB）は 4GB の GPU に載らないので、ブロックを CPU に置き、使うときだけ GPU に転送します。
+- **`--blocks_to_swap 24` を付ける**（RX 550 で検証した設定）。`--vram_budget_mb`（前の節）でも同様のスワップを自動で決められますが、RX 550 での検証は上記の指定のみです。 Anima の重み（約 4GB）は 4GB の GPU に載らないので、ブロックを CPU に置き、使うときだけ GPU に転送します。
   CUDA 以外では、この指定は自動で通常のスワップ（凍結重みを CPU の原本から転送するだけで、書き戻しはしない方式）になります。
 - `--gradient_checkpointing` を併用する（活性化を約 5GB → 0.3GB に減らす）。
 - LoRA の `--network_dim` は 16 のまま。これを上げると GPU メモリと時間が増えます。
