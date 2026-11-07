@@ -20,6 +20,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGr
 from packaging.version import Version
 
 import library.deepspeed_utils as deepspeed_utils
+import library.device_utils as device_utils
 from library.utils import setup_logging
 
 setup_logging()
@@ -149,6 +150,7 @@ def prepare_accelerator(args: argparse.Namespace):
         dynamo_backend=dynamo_backend,
         deepspeed_plugin=deepspeed_plugin,
     )
+    device_utils.override_accelerator_device(accelerator)  # 外部バックエンド（vk 等）使用時のみ。accelerate は cpu と判定するため
     print("accelerator device:", accelerator.device)
     return accelerator
 

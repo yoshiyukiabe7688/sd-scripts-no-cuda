@@ -152,3 +152,61 @@ def test_mps_availability_uses_torch_backends(monkeypatch):
     assert "mps" in device_utils.get_rng_states()
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     assert "mps" not in device_utils.get_rng_states()
+
+
+# ---- 外部バックエンド（SD_SCRIPTS_BACKEND / init_external_backend / override_accelerator_device） ----
+
+
+@pytest.fixture
+def clean_external_backend(monkeypatch):
+    """外部バックエンドの状態をテストごとに元へ戻す。"""
+    monkeypatch.setattr(device_utils, "_external_backend", None)
+    monkeypatch.setattr(device_utils, "_ACCELERATOR_BACKENDS", list(device_utils._ACCELERATOR_BACKENDS))
+    monkeypatch.setattr(device_utils, "_EXTERNAL_BACKEND_MODULES", dict(device_utils._EXTERNAL_BACKEND_MODULES))
+    device_utils.get_preferred_device.cache_clear()
+    yield
+    device_utils.get_preferred_device.cache_clear()
+
+
+def test_init_external_backend_is_noop_without_request(clean_external_backend, monkeypatch):
+    monkeypatch.delenv("SD_SCRIPTS_BACKEND", raising=False)
+    assert device_utils.init_external_backend() is None
+    assert device_utils._external_backend is None
+
+
+def test_init_external_backend_registers_and_becomes_preferred(clean_external_backend, monkeypatch):
+    monkeypatch.setitem(__import__("sys").modules, "fake_backend_module", types.ModuleType("fake_backend_module"))
+    device_utils._EXTERNAL_BACKEND_MODULES["meta"] = "fake_backend_module"
+    monkeypatch.setenv("SD_SCRIPTS_BACKEND", "meta")
+    assert device_utils.init_external_backend() == "meta"
+    assert "meta" in device_utils._ACCELERATOR_BACKENDS
+    assert device_utils.get_preferred_device() == torch.device("meta")
+
+
+def test_init_external_backend_raises_when_requested_but_missing(clean_external_backend):
+    device_utils._EXTERNAL_BACKEND_MODULES["fakedev"] = "no_such_module_xyz"
+    with pytest.raises(RuntimeError, match="no_such_module_xyz"):
+        device_utils.init_external_backend("fakedev")
+    assert device_utils._external_backend is None  # CPU に黙って落とさない
+
+
+def test_override_accelerator_device_is_noop_without_backend(clean_external_backend):
+    from accelerate.state import PartialState
+
+    before = PartialState().device
+    device_utils.override_accelerator_device()
+    assert PartialState().device == before
+
+
+def test_override_accelerator_device_sets_state_device(clean_external_backend, monkeypatch):
+    from accelerate import Accelerator
+    from accelerate.state import AcceleratorState
+
+    AcceleratorState._reset_state(reset_partial_state=True)
+    try:
+        acc = Accelerator(cpu=True)
+        monkeypatch.setattr(device_utils, "_external_backend", "meta")  # 実在する非 CPU のデバイス型で代用
+        device_utils.override_accelerator_device(acc)
+        assert acc.device == torch.device("meta")
+    finally:
+        AcceleratorState._reset_state(reset_partial_state=True)
