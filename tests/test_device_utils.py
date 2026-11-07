@@ -243,7 +243,7 @@ def _fake_cpu(monkeypatch, machine="x86_64", avx512_bf16=False, amx=False):
 
     monkeypatch.setattr(platform, "machine", lambda: machine)
     monkeypatch.setattr(torch.cpu, "_is_avx512_bf16_supported", lambda: avx512_bf16, raising=False)
-    monkeypatch.setattr(torch.cpu, "_is_amx_bf16_supported", lambda: amx, raising=False)
+    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: amx, raising=False)
 
 
 def test_cpu_has_native_bf16_follows_avx512_bf16_or_amx(monkeypatch):
@@ -263,6 +263,16 @@ def test_cpu_has_native_bf16_is_true_for_non_x86_and_when_unknown(monkeypatch):
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.delattr(torch.cpu, "_is_avx512_bf16_supported", raising=False)
     assert device_utils.cpu_has_native_bf16() is True  # API が無ければ従来どおり
+
+
+def test_cpu_has_native_bf16_without_amx_api(monkeypatch):
+    # torch 2.8 の実機 (AVX2 のみの CPU) の状況: AMX の判定関数が無くても AVX512_BF16 だけで判定でき、False になること
+    _fake_cpu(monkeypatch, avx512_bf16=False)
+    monkeypatch.delattr(torch.cpu, "_is_amx_tile_supported", raising=False)
+    assert device_utils.cpu_has_native_bf16() is False
+    _fake_cpu(monkeypatch, avx512_bf16=True)
+    monkeypatch.delattr(torch.cpu, "_is_amx_tile_supported", raising=False)
+    assert device_utils.cpu_has_native_bf16() is True
 
 
 def test_prefer_fp32_for_host_compute(monkeypatch, clean_external_backend):

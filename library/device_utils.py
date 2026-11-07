@@ -104,8 +104,13 @@ def cpu_has_native_bf16() -> bool:
 
     if platform.machine().lower() not in ("x86_64", "amd64"):
         return True
+    # torch のバージョンで存在する判定関数が違う（2.8 には _is_amx_bf16_supported が無い）。AMX は tile の有無で見る
+    avx512_bf16 = getattr(torch.cpu, "_is_avx512_bf16_supported", None)
+    amx_tile = getattr(torch.cpu, "_is_amx_tile_supported", None)
+    if avx512_bf16 is None:
+        return True  # 判定手段が無い
     try:
-        return bool(torch.cpu._is_avx512_bf16_supported()) or bool(torch.cpu._is_amx_bf16_supported())
+        return bool(avx512_bf16()) or bool(amx_tile is not None and amx_tile())
     except Exception:
         return True
 
