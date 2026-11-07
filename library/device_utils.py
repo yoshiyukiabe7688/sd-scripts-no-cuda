@@ -1,5 +1,7 @@
 import functools
 import gc
+import importlib
+import os
 from typing import Optional, Union
 
 import torch
@@ -29,14 +31,143 @@ except Exception:
     HAS_XPU = False
 
 
+# torch.<name> モジュール（get_rng_state / set_rng_state / manual_seed / seed / empty_cache を持つ）を提供する
+# アクセラレータの名前。CUDA 以外のデバイス（将来の vulkan など）は register_accelerator_backend で追加する。
+_ACCELERATOR_BACKENDS = ["cuda", "xpu", "mps"]
+
+
+def register_accelerator_backend(name: str):
+    r"""
+    `torch.<name>` モジュールを持つデバイスバックエンドを、乱数状態・シード・キャッシュ解放の対象に追加する。
+    Add a device backend (`torch.<name>` module) to the targets of the RNG / seed / cache helpers below.
+    """
+    if name not in _ACCELERATOR_BACKENDS:
+        _ACCELERATOR_BACKENDS.append(name)
+
+
+# 環境変数 SD_SCRIPTS_BACKEND で明示的に選ぶ外部バックエンド（PrivateUse1 デバイス）。名前 -> import するモジュール。
+# 例: SD_SCRIPTS_BACKEND=vk  （torch_vulkan をインストール済みの場合）
+_EXTERNAL_BACKEND_MODULES = {"vk": "torch_vulkan"}
+_external_backend: Optional[str] = None
+
+
+def init_external_backend(name: Optional[str] = None) -> Optional[str]:
+    r"""
+    外部バックエンドを import して登録する。name 省略時は環境変数 SD_SCRIPTS_BACKEND を使う（未設定なら何もしない）。
+    指定したのに import できない場合は、黙って CPU に落とさずエラーにする。
+    Import and register an external device backend. Raises if explicitly requested but unavailable.
+    """
+    global _external_backend
+    name = name or os.environ.get("SD_SCRIPTS_BACKEND")
+    if not name:
+        return None
+    if _external_backend == name:
+        return name
+    module_name = _EXTERNAL_BACKEND_MODULES.get(name, name)
+    try:
+        importlib.import_module(module_name)
+    except Exception as e:
+        raise RuntimeError(
+            f"backend '{name}' was requested (SD_SCRIPTS_BACKEND) but module '{module_name}' could not be imported: {e} / "
+            f"バックエンド '{name}' が指定されましたが、モジュール '{module_name}' を import できません: {e}"
+        ) from e
+    register_accelerator_backend(name)
+    _external_backend = name
+    get_preferred_device.cache_clear()
+    return name
+
+
+def override_accelerator_device(accelerator=None):
+    r"""
+    accelerate は外部バックエンドを知らず device を cpu と判定するので、外部バックエンド使用時は vk 等に上書きする。
+    外部バックエンドが無効なら何もしない。accelerator.device は state.device を返すので、state を書き換える。
+    accelerate does not know external backends and reports cpu; override its state device when one is active.
+    """
+    if _external_backend is None:
+        return
+    from accelerate.state import AcceleratorState, PartialState
+
+    device = torch.device(_external_backend)
+    PartialState().device = device
+    AcceleratorState().device = device
+
+
+def _available_accelerator_modules():
+    r"""利用可能なアクセラレータの (名前, torch.<name> モジュール) を列挙する。"""
+    for name in _ACCELERATOR_BACKENDS:
+        module = getattr(torch, name, None)
+        if module is None:
+            continue
+        try:
+            # torch.mps には is_available() が無いので torch.backends.mps で判定する
+            available = torch.backends.mps.is_available() if name == "mps" else module.is_available()
+            if available:
+                yield name, module
+        except Exception:
+            continue
+
+
+def empty_cache():
+    r"""利用可能な全アクセラレータのキャッシュを解放する（gc.collect は呼ばない）。"""
+    for _, module in _available_accelerator_modules():
+        try:
+            module.empty_cache()
+        except Exception:
+            pass
+
+
 def clean_memory():
     gc.collect()
-    if HAS_CUDA:
-        torch.cuda.empty_cache()
-    if HAS_XPU:
-        torch.xpu.empty_cache()
-    if HAS_MPS:
-        torch.mps.empty_cache()
+    empty_cache()
+
+
+def get_rng_states() -> dict:
+    r"""
+    CPU と、利用可能な全アクセラレータの乱数状態を取得する。サンプル画像生成の前後で学習の乱数列を保つために使う。
+    Get RNG states of the CPU and all available accelerators. Pass the result to `set_rng_states` to restore.
+    """
+    states = {"cpu": torch.get_rng_state()}
+    for name, module in _available_accelerator_modules():
+        try:
+            states[name] = module.get_rng_state()
+        except Exception:
+            pass
+    return states
+
+
+def set_rng_states(states: dict):
+    r"""`get_rng_states` で取得した乱数状態を復元する。取得時に無かった・今は使えないデバイスは無視する。"""
+    if "cpu" in states:
+        torch.set_rng_state(states["cpu"])
+    for name, module in _available_accelerator_modules():
+        if name in states:
+            try:
+                module.set_rng_state(states[name])
+            except Exception:
+                pass
+
+
+def manual_seed_all(seed: int):
+    r"""CPU と、利用可能な全アクセラレータの乱数シードを固定する。"""
+    torch.manual_seed(seed)
+    for _, module in _available_accelerator_modules():
+        try:
+            if hasattr(module, "manual_seed_all"):
+                module.manual_seed_all(seed)
+            else:
+                module.manual_seed(seed)
+        except Exception:
+            pass
+
+
+def random_seed():
+    r"""CPU と、利用可能な全アクセラレータの乱数シードを非決定的な値にする（`torch.seed()` 相当）。"""
+    torch.seed()
+    for _, module in _available_accelerator_modules():
+        try:
+            module.seed()
+        except Exception:
+            pass
 
 
 def clean_memory_on_device(device: Optional[Union[str, torch.device]]):
@@ -55,6 +186,8 @@ def clean_memory_on_device(device: Optional[Union[str, torch.device]]):
         torch.xpu.empty_cache()
     if device.type == "mps":
         torch.mps.empty_cache()
+    if device.type == _external_backend:
+        getattr(torch, device.type).empty_cache()
 
 
 def synchronize_device(device: Optional[Union[str, torch.device]]):
@@ -68,6 +201,8 @@ def synchronize_device(device: Optional[Union[str, torch.device]]):
         torch.xpu.synchronize()
     elif device.type == "mps":
         torch.mps.synchronize()
+    elif device.type == _external_backend:
+        getattr(torch, device.type).synchronize()
 
 
 @functools.lru_cache(maxsize=None)
@@ -75,7 +210,10 @@ def get_preferred_device() -> torch.device:
     r"""
     Do not call this function from training scripts. Use accelerator.device instead.
     """
-    if HAS_CUDA:
+    if _external_backend is not None:
+        # 環境変数で明示された外部バックエンドが最優先
+        device = torch.device(_external_backend)
+    elif HAS_CUDA:
         device = torch.device("cuda")
     elif HAS_XPU:
         device = torch.device("xpu")
@@ -106,3 +244,7 @@ def init_ipex():
             return
     except Exception as e:
         print("failed to initialize ipex:", e)
+
+
+# 環境変数 SD_SCRIPTS_BACKEND が指定されていれば、import 時に外部バックエンドを有効にする（未指定なら何もしない）
+init_external_backend()

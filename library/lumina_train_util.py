@@ -17,6 +17,7 @@ from safetensors.torch import save_file
 from library import lumina_models, strategy_base, strategy_lumina, checkpoint_io, sampling
 import library.model_io as model_io
 from library.flux_models import AutoEncoder
+from library import device_utils
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 from library.safetensors_utils import mem_eff_save_file
@@ -183,14 +184,7 @@ def sample_images(
     os.makedirs(save_dir, exist_ok=True)
 
     # save random state to restore later
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    try:
-        cuda_rng_state = (
-            torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-        )
-    except Exception:
-        pass
+    rng_states = device_utils.get_rng_states()
 
     batch_size = args.sample_batch_size or args.train_batch_size or 1
 
@@ -239,9 +233,7 @@ def sample_images(
                     controlnet,
                 )
 
-    torch.set_rng_state(rng_state)
-    if cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state)
+    device_utils.set_rng_states(rng_states)
 
     clean_memory_on_device(accelerator.device)
 

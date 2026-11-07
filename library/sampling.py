@@ -47,6 +47,7 @@ from diffusers import (
     PNDMScheduler,
 )
 
+from library import device_utils
 from library.device_utils import clean_memory_on_device
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
 
@@ -347,12 +348,7 @@ def sample_images_common(
     os.makedirs(save_dir, exist_ok=True)
 
     # save random state to restore later
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    try:
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    except Exception:
-        pass
+    rng_states = device_utils.get_rng_states()
 
     if distributed_state.num_processes <= 1:
         # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
@@ -378,9 +374,7 @@ def sample_images_common(
     # clear pipeline and cache to reduce vram usage
     del pipeline
 
-    torch.set_rng_state(rng_state)
-    if torch.cuda.is_available() and cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state)
+    device_utils.set_rng_states(rng_states)
     vae.to(org_vae_device)
 
     clean_memory_on_device(accelerator.device)
@@ -415,14 +409,10 @@ def sample_image_inference(
             negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
     if seed is not None:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
+        device_utils.manual_seed_all(seed)
     else:
         # True random sample image generation
-        torch.seed()
-        if torch.cuda.is_available():
-            torch.cuda.seed()
+        device_utils.random_seed()
 
     scheduler = get_my_scheduler(
         sample_sampler=sampler_name,
@@ -486,9 +476,7 @@ def sample_image_inference(
             inpaint_mask=inpaint_mask,
         )
 
-    if torch.cuda.is_available():
-        with torch.cuda.device(torch.cuda.current_device()):
-            torch.cuda.empty_cache()
+    device_utils.empty_cache()
 
     image = pipeline.latents_to_image(latents)[0]
 

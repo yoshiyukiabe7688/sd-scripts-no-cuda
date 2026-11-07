@@ -29,7 +29,7 @@ from torch.utils.checkpoint import checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 
-from library import custom_offloading_utils
+from library import custom_offloading_utils, device_utils
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -242,8 +242,9 @@ class TimestepEmbedder(GradientCheckpointMixin):
 
 
 def to_cuda(x):
+    """Move tensors (nested in list/tuple/dict) to the preferred accelerator device (the name is kept for backward compatibility)."""
     if isinstance(x, torch.Tensor):
-        return x.cuda()
+        return x.to(device_utils.get_preferred_device())
     elif isinstance(x, (list, tuple)):
         return [to_cuda(elem) for elem in x]
     elif isinstance(x, dict):
@@ -573,7 +574,7 @@ def apply_rope(
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor
             and key tensor with rotary embeddings.
     """
-    with torch.autocast("cuda", enabled=False):
+    with torch.autocast(device_type=x_in.device.type, enabled=False):
         x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
         freqs_cis = freqs_cis.unsqueeze(2)
         x_out = torch.view_as_real(x * freqs_cis).flatten(3)

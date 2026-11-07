@@ -13,6 +13,7 @@ from tqdm import tqdm
 from PIL import Image
 from transformers import CLIPTextModelWithProjection, T5EncoderModel
 
+from library import device_utils
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -416,12 +417,7 @@ def sample_images(
     os.makedirs(save_dir, exist_ok=True)
 
     # save random state to restore later
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    try:
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    except Exception:
-        pass
+    rng_states = device_utils.get_rng_states()
 
     if distributed_state.num_processes <= 1:
         # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
@@ -464,9 +460,7 @@ def sample_images(
                         prompt_replacement,
                     )
 
-    torch.set_rng_state(rng_state)
-    if cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state)
+    device_utils.set_rng_states(rng_states)
 
     clean_memory_on_device(accelerator.device)
 
@@ -501,12 +495,10 @@ def sample_image_inference(
             negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
     if seed is not None:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+        device_utils.manual_seed_all(seed)
     else:
         # True random sample image generation
-        torch.seed()
-        torch.cuda.seed()
+        device_utils.random_seed()
 
     if negative_prompt is None:
         negative_prompt = ""

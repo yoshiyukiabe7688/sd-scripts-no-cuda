@@ -123,6 +123,15 @@ def test_from_args_tolerates_missing_knobs():
     assert cfg.h2d_only is False and cfg.ring_size == 2
 
 
+def test_create_offloader_falls_back_to_classic_on_non_cuda_device():
+    """H2D-only は CUDA 専用。CPU など他デバイスでは通常の ModelOffloader にフォールバックする。"""
+    cfg = BlockSwapConfig.from_args(_args(block_swap_h2d_only=True, gradient_checkpointing=True), torch.device("cpu"), supports_backward=True)
+    assert cfg.h2d_only is True  # 設定自体は保持される
+    blocks = nn.ModuleList([Block(8) for _ in range(4)])
+    offloader = create_offloader("block", list(blocks), 4, 2, cfg)
+    assert isinstance(offloader, ModelOffloader) and not isinstance(offloader, LoRAStreamOffloader)
+
+
 def test_from_args_h2d_only_requires_gradient_checkpointing_for_training():
     with pytest.raises(ValueError, match="gradient_checkpointing"):
         BlockSwapConfig.from_args(_args(block_swap_h2d_only=True), torch.device("cpu"), supports_backward=True)

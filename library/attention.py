@@ -27,6 +27,31 @@ except ImportError:
     xops = None
 
 
+def check_attn_mode_available(attn_mode: Optional[str]) -> None:
+    """Raise a clear error if the requested attention implementation is not installed in this environment.
+
+    "torch" (PyTorch SDPA) is always available and works on every device (CUDA / CPU / other backends).
+    The other implementations need optional packages that are typically CUDA-only.
+    """
+    if attn_mode is None or attn_mode == "torch":
+        return
+    requirements = {
+        "xformers": (xops is not None, "xformers"),
+        "flash": (flash_attn_func is not None, "flash-attn"),
+        "sageattn": (sageattn is not None, "sageattention"),
+    }
+    if attn_mode not in requirements:
+        return  # unknown modes are reported by `attention()` itself
+    available, package = requirements[attn_mode]
+    if not available:
+        raise RuntimeError(
+            f"attn_mode '{attn_mode}' requires the '{package}' package, which is not available in this environment "
+            f"(it is usually CUDA-only). Use attn_mode 'torch' (PyTorch SDPA) instead."
+            f" / attn_mode '{attn_mode}' には '{package}' が必要ですが、この環境では利用できません（通常は CUDA 専用です）。"
+            f"代わりに attn_mode 'torch'（PyTorch SDPA）を指定してください。"
+        )
+
+
 @dataclass
 class AttentionParams:
     attn_mode: Optional[str] = None
@@ -51,12 +76,14 @@ class AttentionParams:
 
     @staticmethod
     def create_attention_params(attn_mode: Optional[str], split_attn: bool) -> "AttentionParams":
+        check_attn_mode_available(attn_mode)
         return AttentionParams(attn_mode, split_attn)
 
     @staticmethod
     def create_attention_params_from_mask(
         attn_mode: Optional[str], split_attn: bool, img_len: Optional[int], attention_mask: Optional[torch.Tensor]
     ) -> "AttentionParams":
+        check_attn_mode_available(attn_mode)
         if attention_mask is None:
             # No attention mask provided: assume all tokens are valid
             return AttentionParams(attn_mode, split_attn, None, None, None, None, None)
