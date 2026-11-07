@@ -1006,7 +1006,15 @@ class NetworkTrainer:
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
-        vae_dtype = (torch.float32 if args.no_half_vae else weight_dtype) if self.cast_vae(args) else None
+        no_half_vae = args.no_half_vae
+        if not no_half_vae and weight_dtype != torch.float32 and device_utils.prefer_fp32_for_host_compute(accelerator.device):
+            # AVX2 止まりの CPU では bf16/fp16 の畳み込みが極端に遅い。VAE を CPU 側で計算する場合は fp32 にする（--no_half_vae と同じ）
+            logger.info(
+                "CPU without native bf16 (no AVX512_BF16/AMX) runs the VAE: using float32 for the VAE (same as --no_half_vae) / "
+                "bf16 を高速に扱えない CPU で VAE を計算するため、VAE を fp32 にします（--no_half_vae 相当）"
+            )
+            no_half_vae = True
+        vae_dtype = (torch.float32 if no_half_vae else weight_dtype) if self.cast_vae(args) else None
 
         # load target models: unet may be None for lazy loading
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)

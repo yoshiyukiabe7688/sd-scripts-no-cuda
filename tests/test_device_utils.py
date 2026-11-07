@@ -228,3 +228,59 @@ def test_get_accelerator_count_sums_registered_backends(monkeypatch):
     # device_count を持たないバックエンドは 1 台として数える
     monkeypatch.setattr(torch, "fakedev", types.SimpleNamespace(is_available=lambda: True), raising=False)
     assert device_utils.get_accelerator_count() == base + 1
+
+
+@pytest.mark.parametrize("value", ["cpu", "CPU", "none", " cpu "])
+def test_init_external_backend_treats_cpu_and_none_as_no_backend(clean_external_backend, monkeypatch, value):
+    monkeypatch.setenv("SD_SCRIPTS_BACKEND", value)
+    assert device_utils.init_external_backend() is None
+    assert device_utils._external_backend is None
+
+
+# ---- cpu_has_native_bf16 / prefer_fp32_for_host_compute ----
+def _fake_cpu(monkeypatch, machine="x86_64", avx512_bf16=False, amx=False):
+    import platform
+
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.setattr(torch.cpu, "_is_avx512_bf16_supported", lambda: avx512_bf16, raising=False)
+    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: amx, raising=False)
+
+
+def test_cpu_has_native_bf16_follows_avx512_bf16_or_amx(monkeypatch):
+    _fake_cpu(monkeypatch, avx512_bf16=False, amx=False)
+    assert device_utils.cpu_has_native_bf16() is False  # AVX2 止まり
+    _fake_cpu(monkeypatch, avx512_bf16=True)
+    assert device_utils.cpu_has_native_bf16() is True
+    _fake_cpu(monkeypatch, amx=True)
+    assert device_utils.cpu_has_native_bf16() is True
+
+
+def test_cpu_has_native_bf16_is_true_for_non_x86_and_when_unknown(monkeypatch):
+    _fake_cpu(monkeypatch, machine="arm64")
+    assert device_utils.cpu_has_native_bf16() is True  # 判定しない（従来の挙動）
+    import platform
+
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.delattr(torch.cpu, "_is_avx512_bf16_supported", raising=False)
+    assert device_utils.cpu_has_native_bf16() is True  # API が無ければ従来どおり
+
+
+def test_cpu_has_native_bf16_without_amx_api(monkeypatch):
+    # torch 2.8 の実機 (AVX2 のみの CPU) の状況: AMX の判定関数が無くても AVX512_BF16 だけで判定でき、False になること
+    _fake_cpu(monkeypatch, avx512_bf16=False)
+    monkeypatch.delattr(torch.cpu, "_is_amx_tile_supported", raising=False)
+    assert device_utils.cpu_has_native_bf16() is False
+    _fake_cpu(monkeypatch, avx512_bf16=True)
+    monkeypatch.delattr(torch.cpu, "_is_amx_tile_supported", raising=False)
+    assert device_utils.cpu_has_native_bf16() is True
+
+
+def test_prefer_fp32_for_host_compute(monkeypatch, clean_external_backend):
+    _fake_cpu(monkeypatch, avx512_bf16=False)
+    assert device_utils.prefer_fp32_for_host_compute("cpu") is True
+    assert device_utils.prefer_fp32_for_host_compute(torch.device("cuda")) is False  # CUDA は対象外
+    assert device_utils.prefer_fp32_for_host_compute(torch.device("mps")) is False
+    monkeypatch.setattr(device_utils, "_external_backend", "meta")  # 外部バックエンド（vk）の代用
+    assert device_utils.prefer_fp32_for_host_compute(torch.device("meta")) is True
+    _fake_cpu(monkeypatch, avx512_bf16=True)
+    assert device_utils.prefer_fp32_for_host_compute("cpu") is False  # bf16 が速い CPU では変えない

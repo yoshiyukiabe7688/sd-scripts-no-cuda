@@ -59,7 +59,8 @@ def init_external_backend(name: Optional[str] = None) -> Optional[str]:
     """
     global _external_backend
     name = name or os.environ.get("SD_SCRIPTS_BACKEND")
-    if not name:
+    if not name or name.strip().lower() in ("cpu", "none"):
+        # 未指定、または "cpu" / "none" は「外部バックエンドを使わない」（CUDA 等が使えればそちら、無ければ CPU）
         return None
     if _external_backend == name:
         return name
@@ -90,6 +91,39 @@ def override_accelerator_device(accelerator=None):
     device = torch.device(_external_backend)
     PartialState().device = device
     AcceleratorState().device = device
+
+
+def cpu_has_native_bf16() -> bool:
+    r"""
+    x86 CPU が bf16 を高速に扱えるか（AVX512_BF16 または AMX）。判定できない場合・x86 以外（ARM など）は True を返し、
+    従来の挙動を変えない。AVX2 止まりの CPU（Intel の新しめの世代にも多い）では bf16 の畳み込みが参照実装に落ちて、
+    シングルスレッドで極端に遅くなる（実測: VAE の潜在キャッシュ 12 枚が 30 分たっても終わらない。fp32 なら約 45 秒）。
+    Whether an x86 CPU runs bf16 natively (AVX512_BF16 or AMX). Returns True when unknown / non-x86 (keeps old behavior).
+    """
+    import platform
+
+    if platform.machine().lower() not in ("x86_64", "amd64"):
+        return True
+    # torch のバージョンで存在する判定関数が違う（2.8 には _is_amx_bf16_supported が無い）。AMX は tile の有無で見る
+    avx512_bf16 = getattr(torch.cpu, "_is_avx512_bf16_supported", None)
+    amx_tile = getattr(torch.cpu, "_is_amx_tile_supported", None)
+    if avx512_bf16 is None:
+        return True  # 判定手段が無い
+    try:
+        return bool(avx512_bf16()) or bool(amx_tile is not None and amx_tile())
+    except Exception:
+        return True
+
+
+def prefer_fp32_for_host_compute(device: Union[str, torch.device]) -> bool:
+    r"""
+    モデル（VAE など）の計算が実質 CPU で行われ、かつ CPU が bf16 を高速に扱えないとき True。
+    対象: device が cpu、または畳み込みなどを CPU にフォールバックする外部バックエンド（vk）。CUDA / XPU / MPS は対象外。
+    True のとき、CPU 上で動かすモデルは fp32 にした方が速い（`--no_half_vae` を自動で選ぶ）。
+    """
+    device = torch.device(device)
+    runs_on_host = device.type == "cpu" or (_external_backend is not None and device.type == _external_backend)
+    return runs_on_host and not cpu_has_native_bf16()
 
 
 def _available_accelerator_modules():

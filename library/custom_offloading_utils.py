@@ -121,6 +121,69 @@ def _pair_modules(layer_a: nn.Module, layer_b: nn.Module) -> list[Tuple[nn.Modul
     return [(modules_a[name], modules_b[name]) for name in modules_a]
 
 
+def set_weight_data(module: nn.Module, tensor: torch.Tensor):
+    """
+    `module.weight.data = tensor` と同じ。ただしデバイスをまたぐ代入ができないデバイスでは Parameter を作り直す。
+
+    PyTorch は CPU/CUDA/MPS/XPU などの「互換な dense デバイス」同士でしか `.data` を差し替えられない。
+    自作の PrivateUse1 デバイス（Vulkan の `vk` など）は互換扱いにならず、`variable and tensor have incompatible tensor type`
+    で失敗する。その場合は同じ requires_grad の新しい Parameter に置き換える。ブロックスワップの対象は凍結した重みで、
+    オプティマイザには渡っておらず、スワップ時点では autograd の保存テンソルも解放済み（勾配チェックポイント前提）なので安全。
+    """
+    try:
+        module.weight.data = tensor
+    except RuntimeError:
+        module.weight = nn.Parameter(tensor, requires_grad=module.weight.requires_grad)
+
+
+# 凍結した重みのホスト側の原本を覚えておく属性名。スワップアウトのたびに GPU からホストへ戻す必要がなくなる。
+# （GPU -> ホストは、環境によってはホスト -> GPU より桁違いに遅い。RX 550 + RADV の実測: 0.8 GB/s 対 3.9 GB/s、
+#   書き込み結合メモリ経由だと 0.2 GB/s）
+_CPU_MASTER_ATTR = "_offload_cpu_master"
+
+
+def _remember_cpu_master(module: nn.Module, weight: torch.Tensor, cpu_tensor: torch.Tensor):
+    if not weight.requires_grad:
+        setattr(module, _CPU_MASTER_ATTR, cpu_tensor)
+
+
+def _cpu_master_of(module: nn.Module):
+    """凍結した重みのホスト側の原本。無ければ None。"""
+    if module.weight.requires_grad:
+        return None
+    return getattr(module, _CPU_MASTER_ATTR, None)
+
+
+def to_device_keeping_weights_on_cpu(block: nn.Module, device: torch.device):
+    """
+    `block.to(device)` の後に `weighs_to_device(block, "cpu")` を呼ぶのと同じ結果にする。ただし weight を一度もデバイスに載せない。
+    （従来の手順は、スワップ対象ブロックの重みを毎 step いったんデバイスへアップロードし、すぐ CPU に戻していた）
+    weight 以外（bias・バッファ）だけをデバイスへ移す。weight がデバイス上にある場合は、ホスト側の原本があればそれに戻す。
+    """
+    cpu = torch.device("cpu")
+    for module in block.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None:
+                continue
+            target = cpu if name == "weight" else device
+            if param.device.type == target.type:
+                continue
+            if name == "weight":
+                tensor = _cpu_master_of(module)
+                if tensor is None:
+                    tensor = param.data.to(cpu, non_blocking=True)
+                    _remember_cpu_master(module, param, tensor)
+            else:
+                tensor = param.data.to(device, non_blocking=True)
+            try:
+                param.data = tensor
+            except RuntimeError:  # デバイスをまたぐ .data 代入ができないデバイス（set_weight_data と同じ理由）
+                module._parameters[name] = nn.Parameter(tensor, requires_grad=param.requires_grad)
+        for name, buf in list(module._buffers.items()):
+            if buf is not None and buf.device.type != device.type:
+                module._buffers[name] = buf.to(device)
+
+
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
     """
     Swap block weights between the compute device and the CPU for non-CUDA accelerators (xpu / mps).
@@ -141,14 +204,23 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
     # device to cpu
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-        module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
+        master = _cpu_master_of(module_to_cpu)
+        if master is not None:
+            # 凍結した重みはホスト側に原本がある。GPU から戻さず、原本をそのまま使う
+            set_weight_data(module_to_cpu, master)
+        else:
+            cpu_copy = cuda_data_view.data.to("cpu", non_blocking=True)
+            _remember_cpu_master(module_to_cpu, module_to_cpu.weight, cpu_copy)
+            set_weight_data(module_to_cpu, cpu_copy)
 
     _synchronize_device(device)
 
     # cpu to device
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-        cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
-        module_to_cuda.weight.data = cuda_data_view
+        host_weight = module_to_cuda.weight.data
+        cuda_data_view.copy_(host_weight, non_blocking=True)
+        _remember_cpu_master(module_to_cuda, module_to_cuda.weight, host_weight)  # このホスト側の重みを原本として覚える
+        set_weight_data(module_to_cuda, cuda_data_view)
 
     _synchronize_device(device)
 
@@ -156,7 +228,7 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 def weighs_to_device(layer: nn.Module, device: torch.device):
     for module in layer.modules():
         if hasattr(module, "weight") and module.weight is not None:
-            module.weight.data = module.weight.data.to(device, non_blocking=True)
+            set_weight_data(module, module.weight.data.to(device, non_blocking=True))
 
 
 class Offloader:
@@ -302,8 +374,12 @@ class ModelOffloader(Offloader):
             weighs_to_device(b, self.device)  # make sure weights are on device
 
         for b in blocks[self.num_blocks - self.blocks_to_swap :]:
-            b.to(self.device)  # move block to device first. this makes sure that buffers (non weights) are on the device
-            weighs_to_device(b, torch.device("cpu"))  # make sure weights are on cpu
+            if self.device.type == "cuda":
+                b.to(self.device)  # move block to device first. this makes sure that buffers (non weights) are on the device
+                weighs_to_device(b, torch.device("cpu"))  # make sure weights are on cpu
+            else:
+                # 他のデバイスでは、重みをいちど載せてから戻す往復（毎 step、ブロック数 x 126MB 級）を避ける
+                to_device_keeping_weights_on_cpu(b, self.device)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)
