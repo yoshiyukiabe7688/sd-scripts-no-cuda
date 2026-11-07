@@ -1,7 +1,7 @@
 # Anima / Anima-Turbo を CUDA 無しで学習する（Vulkan バックエンド）
 
 CUDA が使えない環境（AMD GPU など）で、Anima / Anima-Turbo の LoRA 学習を **Vulkan** 上で実行する手順です。
-PyTorch の標準 Vulkan は推論専用なので、学習用の自作デバイス `vk`（PrivateUse1）を別プロジェクト `torch-vulkan` として用意しています。
+PyTorch の標準 Vulkan は推論専用なので、学習用の自作デバイス `vk`（PrivateUse1）を別プロジェクト [`torch-vulkan`](https://github.com/yoshiyukiabe7688/torch-vulkan)（公開・MIT ライセンス）として用意しています。
 学習スクリプト（`anima_train_network.py`）は無改造で、環境変数 `SD_SCRIPTS_BACKEND=vk` を付けるだけで GPU を使います。
 CPU のみでも学習できます（環境変数なし。bf16 で約 10 秒/step）。
 
@@ -14,7 +14,7 @@ CPU のみでも学習できます（環境変数なし。bf16 で約 10 秒/ste
 ## 必要なもの
 - Vulkan 対応 GPU とドライバ。協調行列（`VK_KHR_cooperative_matrix`）があると行列積が速くなる（無ければ自動でタイル型 GEMM に切り替わる）。
 - `torch-vulkan` のビルド: Visual Studio 2022（MSVC）、Rust（cargo）、Vulkan SDK（シェーダを再生成する場合のみ。生成済み SPIR-V はコミット済み）。
-- `torch-vulkan` は sd-scripts のリポジトリ外にあります（例: `C:\Users\<you>\dev\torch-vulkan`）。
+- `torch-vulkan` は sd-scripts とは別リポジトリです。<https://github.com/yoshiyukiabe7688/torch-vulkan> を任意の場所に clone してください（例: `C:\Users\<you>\dev\torch-vulkan`）。
 
 ## 手順
 1. `torch-vulkan` をビルドする（`run_build.cmd`。MSVC 環境を読み込み、cargo で Rust ランタイムを、続いて C++ シムをビルドする）。
