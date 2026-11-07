@@ -37,6 +37,32 @@ python anima_train_network.py `
   --network_train_unet_only --max_data_loader_n_workers=0
 ```
 
+## 少ない VRAM の GPU で動かす（`--vram_budget_mb`）
+VRAM が少ない GPU（4GB 級。表示用に取られる分を除いた 3GB 前後）でも学習できます。`--vram_budget_mb` に使ってよい VRAM（MiB）を渡すと、
+**収まるように勾配チェックポイントとブロックスワップ（H2D 専用）の設定を自動で決めます**（`--gradient_checkpointing` や `--blocks_to_swap` を自分で指定する必要はありません）。
+
+```powershell
+python anima_train_network.py ... --vram_budget_mb 3072     # 3GB に収める
+python anima_train_network.py ... --vram_budget_mb auto     # デバイスが報告する使用可能量（表示用などを除いた分）から決める
+```
+
+- 仕組み: ① 勾配チェックポイントで活性化を約 5GB → 約 0.3GB に減らす。② 凍結しているベース重み（Anima で約 3.7GB）の一部を CPU に置き、
+  GPU 上の 2 枠のリングバッファへ順番に転送して使う（書き戻しはしない）。どちらも**計算結果は変わりません**（予算なしの学習と LoRA がビット一致することを確認済み）。
+- 予算ごとの構成（Anima-base、512px、batch 1、bf16、rank 16 の実測。使用量は GPU に確保したメモリ）:
+
+| 予算 | スワップするブロック数（28 中） | 実測のピーク確保量 | 速度 |
+|---|---|---|---|
+| なし（16GB） | 0（チェックポイントも無し） | 約 9.0GB | 約 1.06 秒/step |
+| 3072 MiB | 15 | 約 2.7GB | 約 1.9 秒/step |
+| 2048 MiB | 23 | 約 1.65GB | 約 2.0 秒/step |
+| 1536 MiB | 26（上限） | 約 1.3GB | 約 1.9 秒/step |
+
+- `vk` で数値を指定したときは、その値を**上限として強制**します（超えると OOM）。大きい GPU で小さい GPU を模擬して、収まるかを試すのに使えます。
+  `auto` は強制しません（OS が許す予算を VK_EXT_memory_budget で取得して決めるだけ）。
+- `--blocks_to_swap` を自分で指定したときは `--vram_budget_mb` は無視されます。`--cpu_offload_checkpointing` / `--unsloth_offload_checkpointing` とは併用できません。
+- 見積もりは 512px・rank 16 の実測を元にしています（解像度と rank に応じて補正）。余裕を持たせてあるので、OOM になる場合は予算を下げてください。
+- メインメモリに、スワップするブロック分の重み（最大で約 3.5GB）が必要です。
+
 ## stable-diffusion.cpp で使う
 出力した LoRA を `--lora-model-dir` のフォルダに置き、プロンプトに `<lora:名前:1.0>` を付ける。
 Turbo は 8〜12 step・CFG 1.0、base は 25 step 前後・CFG 5〜6 が目安。
@@ -62,11 +88,14 @@ sd-cli.exe --diffusion-model anima-base-v1.0.safetensors --vae qwen_image_vae.sa
 | `VKT_TRACE_FALLBACK=1` | CPU フォールバックした演算の引数と、vk と CPU の混在を表示（デバッグ用） |
 | `VKRT_PROFILE=1` | カーネル別の GPU 時間を計測（1 dispatch ごとに同期するので遅くなる） |
 | `VKRT_VALIDATION=1` | Vulkan 検証レイヤを有効にする（開発用） |
+| `VKT_MEM_LIMIT_MB=N` | GPU メモリの使用量に上限（MiB）を設け、小さい VRAM の GPU を模擬する（`--vram_budget_mb N` を指定すると自動で設定される） |
 
 ## 制限・注意
 - **GPU で動くのは DiT の学習（fwd/bwd）とオプティマイザ**です。VAE のエンコード・デコード（畳み込み）とテキストエンコーダは CPU で動きます。
   学習中のサンプル画像生成（`--sample_every_n_steps`）は動作しますが、VAE デコードが CPU のため遅くなります。
-- 協調行列カーネルは、同じ入力のタイル型と各呼び出しで一致する（出力丸めの範囲）一方、fp32 を基準にした 1 step 後の勾配の誤差が、タイル型よりやや大きい（相対 L2 誤差 0.36 対 0.27。CPU bf16 は 0.28）ことを観測しています。
-  原因は特定できていません。bf16 学習としては実用上問題なく LoRA は正しく学習できますが、厳密さを優先するなら `VKT_NO_COOP=1` を使ってください（約 1.4 → 2.0 秒/step）。
+- bf16 の勾配には、CPU bf16 でも出る程度の丸め誤差があります（前半ブロックの LoRA 勾配は fp32 基準に対して相対 L2 誤差 0.3〜0.5 程度）。
+  協調行列カーネルは、タイル型と各呼び出しで一致しており、協調行列に固有の問題は見つかっていません。ただし入力によっては、vk のアテンション
+  （ロジットを bf16 に丸めてから softmax する）が原因で勾配が外れ値的にずれることがあります（調査: `torch-vulkan/tools/gradcmp/`）。
+  LoRA は正しく学習できており生成も合格していますが、厳密さを優先するなら `VKT_NO_COOP=1` を使ってください（約 1.4 → 2.0 秒/step）。
 - 1 回の確保は 2GB 以下（Vulkan の `maxMemoryAllocationSize`）。512px の学習では問題になりません。
 - 対象は Anima / Anima-Turbo のみ。SDXL など畳み込み主体のモデルの学習は未対応です（畳み込みの GPU カーネルが無い）。
