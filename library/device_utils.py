@@ -107,6 +107,60 @@ def _available_accelerator_modules():
             continue
 
 
+def get_memory_budget_bytes(device: Union[str, torch.device]) -> Optional[int]:
+    r"""
+    学習に使ってよい VRAM の量（バイト）。取得できないデバイスでは None。
+    - cuda: 現在の空き容量
+    - 外部バックエンド（vk）: OS が許す予算（VK_EXT_memory_budget。表示用や他のプロセスの使用分を除く）から、このプロセスの使用分を除いた残り
+    Free VRAM usable for training in bytes, or None if the device cannot report it.
+    """
+    device = torch.device(device)
+    try:
+        if device.type == "cuda":
+            return int(torch.cuda.mem_get_info(device)[0])
+        if device.type == _external_backend and hasattr(getattr(torch, device.type), "memory_info"):
+            info = getattr(torch, device.type).memory_info()
+            return max(int(info["budget"]) - int(info["usage"]), 0)
+    except Exception:
+        return None
+    return None
+
+
+def set_memory_limit_mb(device: Union[str, torch.device], megabytes: int) -> bool:
+    r"""
+    小さい VRAM の GPU を模擬するために、使用量の上限（MiB）を設ける。対応するデバイス（vk）のみ。設定できたら True。
+    Cap the memory the device may reserve, to emulate a GPU with less VRAM. Supported by the external "vk" backend only.
+    """
+    device = torch.device(device)
+    module = getattr(torch, device.type, None)
+    if device.type == _external_backend and module is not None and hasattr(module, "set_memory_limit"):
+        module.set_memory_limit(int(megabytes))
+        return True
+    return False
+
+
+def get_accelerator_count() -> int:
+    r"""
+    利用可能なアクセラレータ（cuda / xpu / vk など、`_ACCELERATOR_BACKENDS` のうち使えるもの）の合計デバイス数。CPU のみなら 0。
+    Number of visible accelerator devices over all available backends. 0 when only the CPU is available.
+    """
+    total = 0
+    for _, module in _available_accelerator_modules():
+        try:
+            total += int(module.device_count())
+        except Exception:
+            total += 1  # device_count を持たないバックエンド（mps など）は 1 台として数える
+    return total
+
+
+def get_ddp_backend() -> str:
+    r"""
+    分散学習（DDP）のプロセスグループのバックエンド。nccl は Windows 以外の CUDA だけで、それ以外（CPU・xpu・mps・vk など）は gloo。
+    Process group backend for DDP: "nccl" only for CUDA on non-Windows, "gloo" otherwise.
+    """
+    return "nccl" if HAS_CUDA and os.name != "nt" else "gloo"
+
+
 def empty_cache():
     r"""利用可能な全アクセラレータのキャッシュを解放する（gc.collect は呼ばない）。"""
     for _, module in _available_accelerator_modules():
