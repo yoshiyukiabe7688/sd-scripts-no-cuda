@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 _warned_block_swap_on_cpu = False  # warn only once even if several block groups create offloaders
 
+# Devices on which ``LoRAStreamOffloader`` works. "cuda" uses copy streams and events. The others must execute work in
+# submission order on a single queue (so a plain ``copy_`` is ordered with the compute around it): "vk" does.
+_H2D_ONLY_ORDERED_DEVICES = ("vk",)
+
 
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
 def _clean_memory_on_device(device: torch.device):
@@ -33,6 +37,11 @@ def _clean_memory_on_device(device: torch.device):
         torch.xpu.empty_cache()
     if device.type == "mps":
         torch.mps.empty_cache()
+    elif device.type not in ("cuda", "xpu", "cpu"):
+        # out-of-tree devices (e.g. "vk"): use the device module registered as torch.<name>, if it has one
+        module = getattr(torch, device.type, None)
+        if module is not None and hasattr(module, "empty_cache"):
+            module.empty_cache()
 
 
 def _synchronize_device(device: torch.device):
@@ -42,6 +51,10 @@ def _synchronize_device(device: torch.device):
         torch.xpu.synchronize()
     elif device.type == "mps":
         torch.mps.synchronize()
+    elif device.type != "cpu":
+        module = getattr(torch, device.type, None)
+        if module is not None and hasattr(module, "synchronize"):
+            module.synchronize()
 
 
 def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
@@ -404,11 +417,11 @@ def create_offloader(block_type: str, blocks: list[nn.Module], num_blocks: int, 
         )
 
     use_h2d_only = config.h2d_only
-    if use_h2d_only and config.device.type != "cuda":
-        # H2D-only streaming relies on CUDA streams/events; other devices use the generic block swap instead.
+    if use_h2d_only and config.device.type != "cuda" and config.device.type not in _H2D_ONLY_ORDERED_DEVICES:
+        # H2D-only streaming relies on CUDA streams/events (or on an in-order device); other devices use the generic block swap.
         logger.warning(
-            f"--block_swap_h2d_only is CUDA-only; falling back to the generic block swap on device '{config.device.type}'."
-            f" / --block_swap_h2d_only は CUDA 専用のため、デバイス '{config.device.type}' では通常のブロックスワップを使用します。"
+            f"--block_swap_h2d_only is not supported on device '{config.device.type}'; falling back to the generic block swap."
+            f" / --block_swap_h2d_only はデバイス '{config.device.type}' では未対応のため、通常のブロックスワップを使用します。"
         )
         use_h2d_only = False
 
@@ -477,6 +490,33 @@ class _DirectCopier:
     def reset(self):
         self._events.clear()
         self._xfer.clear()
+
+
+class _OrderedCopier:
+    """
+    Transfer engine for ``LoRAStreamOffloader`` on devices that execute everything in submission order on one queue
+    (the "vk" device). A plain ``copy_`` is then already ordered after the compute that last used the destination
+    slot and before the compute that will read it, so no events or copy stream are needed: ``wait`` has nothing to
+    return and ``submit`` ignores the gate event. Same ``submit`` / ``wait`` interface as ``_DirectCopier``.
+    """
+
+    def __init__(self, device: torch.device, debug: bool = False):
+        self.device = device
+
+    def submit(self, key, dst_flat: torch.Tensor, src_flat: torch.Tensor, gate_event=None):
+        dst_flat.copy_(src_flat)
+
+    def wait(self, key):
+        return None
+
+    def pop_xfer_timing(self, key):
+        return None
+
+    def sync(self):
+        _synchronize_device(self.device)
+
+    def reset(self):
+        pass
 
 
 class _StagedCopier:
@@ -587,6 +627,23 @@ class _StagedCopier:
             pool.shutdown(wait=False)
 
 
+def _rebind_param_data(module: nn.Module, name: str, data: torch.Tensor) -> nn.Parameter:
+    """
+    Make ``module.<name>`` hold ``data`` (possibly on another device) and return the Parameter that now holds it.
+
+    ``param.data = tensor`` works across devices on CUDA, but fails with "incompatible tensor type" on out-of-tree devices
+    such as "vk" (and after ``module.to()`` swaps the Parameter objects). In that case a new frozen Parameter replaces it.
+    """
+    p = module._parameters[name]
+    try:
+        p.data = data
+        return p
+    except RuntimeError:
+        p = nn.Parameter(data, requires_grad=p.requires_grad)
+        module._parameters[name] = p
+        return p
+
+
 class LoRAStreamOffloader:
     """
     H2D-only offloader for training where the base weights are frozen (e.g. LoRA / LoHa / LoKr).
@@ -659,7 +716,12 @@ class LoRAStreamOffloader:
         self.debug = debug
         self.debug_interval = int(os.getenv("MUSUBI_TUNER_OFFLOADER_DEBUG_INTERVAL", "10"))  # steps between prints
 
-        assert device.type == "cuda", "LoRAStreamOffloader currently supports CUDA only"
+        self.is_cuda = device.type == "cuda"
+        assert self.is_cuda or device.type in _H2D_ONLY_ORDERED_DEVICES, f"LoRAStreamOffloader does not support device '{device.type}'"
+        if not self.is_cuda:
+            # no pinned memory / CUDA events on these devices; timing instrumentation is CUDA-only
+            self.use_pinned_memory = use_pinned_memory = False
+            self.debug = debug = False
 
         # ---- streaming placement: S evenly spaced block indices (midpoint formula -> distinct for S <= N) ----
         stream_idx = sorted({((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)})
@@ -681,7 +743,9 @@ class LoRAStreamOffloader:
         # ---- transfer engine: owns the copy stream and all H2D primitives ----
         # pinned masters -> direct async H2D; pageable masters -> stage through a worker thread + pinned pool
         # (low "shared GPU memory" footprint, e.g. on Windows). Both expose the same submit/wait interface.
-        if use_pinned_memory:
+        if not self.is_cuda:
+            self.copier = _OrderedCopier(device, debug=self.debug)
+        elif use_pinned_memory:
             self.copier = _DirectCopier(device, debug=self.debug)
         else:
             self.copier = _StagedCopier(device, num_staging=self.B, debug=self.debug)
@@ -757,6 +821,10 @@ class LoRAStreamOffloader:
         """dtype/shape views into a flat uint8 buffer, one per swap tensor, following ``layout``."""
         offsets, _ = layout
         return [flat[off : off + w.numel() * w.element_size()].view(w.dtype).view(w.shape) for off, w in zip(offsets, weights)]
+
+    def _record_free_event(self):
+        """Event marking that compute is done with a ring slot (CUDA only; in-order devices need none)."""
+        return torch.cuda.current_stream().record_event() if self.is_cuda else None
 
     def _load(self, rank: int, slot: int, ctx: str = "fwd"):
         """Stream the streaming block at ``rank`` into ring ``slot`` (H2D only), repointing weights."""
@@ -850,9 +918,7 @@ class LoRAStreamOffloader:
                 b.to(self.device)  # non-swap params/buffers to the device; the placeholders are empty
                 for (m, name, is_param), view in zip(jobs, views):
                     if is_param:
-                        p = m._parameters[name]
-                        p.data = view
-                        master.append(p)  # keep the original Parameter object as the persistent master
+                        master.append(_rebind_param_data(m, name, view))  # keep the original Parameter object when possible
                     else:
                         m._buffers[name] = view
                         master.append(view)
@@ -864,8 +930,7 @@ class LoRAStreamOffloader:
                     t = getattr(m, name)
                     view.copy_(t.data)
                     if is_param:
-                        t.data = view
-                        master.append(t)  # keep the original Parameter object as the persistent master
+                        master.append(_rebind_param_data(m, name, view))  # keep the original Parameter object when possible
                     else:
                         m._buffers[name] = view
                         master.append(view)
@@ -948,7 +1013,7 @@ class LoRAStreamOffloader:
         if self.S == 0 or not self.is_stream[block_idx]:
             return
         j = self.rank[block_idx]
-        self.free_event[j % self.B] = torch.cuda.current_stream().record_event()
+        self.free_event[j % self.B] = self._record_free_event()
         if j + self.B < self.S:
             self._load(j + self.B, (j + self.B) % self.B, "fwd")  # same slot as rank j; evicts rank j
         elif self.forward_only and j == self.S - 1 and self.S > self.B:
@@ -977,7 +1042,7 @@ class LoRAStreamOffloader:
             if prefetch:
                 # consumed block_index in backward: free its slot and prefetch B streaming-slots behind
                 j = self.rank[block_index]
-                self.free_event[j % self.B] = torch.cuda.current_stream().record_event()
+                self.free_event[j % self.B] = self._record_free_event()
                 if j - self.B >= 0:
                     self._load(j - self.B, (j - self.B) % self.B, "bwd")  # same slot as rank j; evicts rank j
             if wait_prev:
