@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from library.device_utils import init_ipex, clean_memory_on_device
+import library.device_utils as device_utils
+import library.vram_budget as vram_budget
 from library.custom_offloading_utils import BlockSwapConfig
 
 init_ipex()
@@ -40,6 +42,64 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.sample_prompts_te_outputs = None
 
+    def _apply_vram_budget(self, args, train_dataset_group):
+        """--vram_budget_mb: 予算に収まるように勾配チェックポイントとブロックスワップを自動で設定する。"""
+        if args.blocks_to_swap:
+            logger.warning(
+                "--blocks_to_swap is specified, so --vram_budget_mb is ignored / --blocks_to_swap が指定されているため --vram_budget_mb は無視します"
+            )
+            return
+        if args.cpu_offload_checkpointing or args.unsloth_offload_checkpointing:
+            raise ValueError(
+                "--vram_budget_mb cannot be combined with --cpu_offload_checkpointing / --unsloth_offload_checkpointing"
+                " / --vram_budget_mb は --cpu_offload_checkpointing / --unsloth_offload_checkpointing と併用できません"
+            )
+
+        device = device_utils.get_preferred_device()
+        value = str(args.vram_budget_mb).strip().lower()
+        if value == "auto":
+            free = device_utils.get_memory_budget_bytes(device)
+            if free is None:
+                raise ValueError(
+                    f"--vram_budget_mb auto is not available on device '{device.type}'; specify the budget in MiB"
+                    f" / デバイス '{device.type}' では --vram_budget_mb auto は使えません。MiB で指定してください"
+                )
+            budget_mib = free / vram_budget.MiB - 256  # 他の確保（ドライバや表示）の揺れに備えた余白
+            logger.info(f"VRAM budget (auto): {budget_mib:.0f} MiB")
+        else:
+            budget_mib = float(value)
+            if device_utils.set_memory_limit_mb(device, int(budget_mib)):
+                logger.info(f"VRAM limit enforced on '{device.type}': {int(budget_mib)} MiB (emulating a smaller GPU)")
+
+        weight_bytes = 2 if args.mixed_precision in ("bf16", "fp16") else 4
+        ds = train_dataset_group.datasets[0] if getattr(train_dataset_group, "datasets", None) else None
+        pixels = (ds.width * ds.height) if ds is not None and getattr(ds, "width", None) else vram_budget.BASE_PIXELS
+        result = vram_budget.plan_for_dit_file(
+            args.pretrained_model_name_or_path,
+            budget_mib,
+            weight_bytes_per_element=weight_bytes,
+            network_dim=args.network_dim or 4,
+            pixels=pixels,
+            ring_size=args.block_swap_ring_size,
+        )
+        if result is None:
+            logger.warning("could not plan the VRAM budget; leaving the memory options as they are / VRAM 予算の計画を立てられませんでした")
+            return
+        logger.info(
+            f"VRAM plan for {budget_mib:.0f} MiB: gradient_checkpointing={result.gradient_checkpointing}, blocks_to_swap={result.blocks_to_swap}"
+            f" (estimated {result.predicted_mib:.0f} MiB; {result.reason})"
+        )
+        if not result.feasible:
+            logger.warning(
+                "the estimate exceeds the budget even with the maximum block swap; training may run out of memory or be slow"
+                " / 最大までスワップしても予算を超える見込みです。メモリ不足または低速になる可能性があります"
+            )
+        if result.gradient_checkpointing:
+            args.gradient_checkpointing = True
+        if result.blocks_to_swap > 0:
+            args.blocks_to_swap = result.blocks_to_swap
+            args.block_swap_h2d_only = device.type in ("cuda", "vk")
+
     def assert_extra_args(
         self,
         args,
@@ -47,6 +107,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         val_dataset_group: Optional[DatasetGroup],
     ):
         flux_train_utils.log_timestep_sampling_info(args)
+
+        if args.vram_budget_mb is not None:
+            self._apply_vram_budget(args, train_dataset_group)
 
         if args.fp8_base or args.fp8_base_unet:
             logger.warning("fp8_base and fp8_base_unet are not supported. / fp8_baseとfp8_base_unetはサポートされていません。")
@@ -465,6 +528,16 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
+    parser.add_argument(
+        "--vram_budget_mb",
+        type=str,
+        default=None,
+        help="VRAM budget in MiB (or 'auto' to use what the device reports as available). Automatically enables gradient checkpointing"
+        " and block swap (H2D-only) as needed so that training fits. Ignored if --blocks_to_swap is given. "
+        "On the vk backend an explicit value also caps the memory the device may use, which emulates a smaller GPU."
+        " / VRAM の予算（MiB。'auto' ならデバイスが報告する空き容量）。収まるように勾配チェックポイントとブロックスワップ（H2D 専用）を自動設定する。"
+        "--blocks_to_swap 指定時は無視。vk では数値指定で使用量の上限も設け、小さい GPU を模擬する。",
+    )
     # parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument(
         "--unsloth_offload_checkpointing",
