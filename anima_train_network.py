@@ -73,6 +73,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 logger.info(f"VRAM limit enforced on '{device.type}': {int(budget_mib)} MiB (emulating a smaller GPU)")
 
         weight_bytes = 2 if args.mixed_precision in ("bf16", "fp16") else 4
+        if getattr(args, "int8_base", False):
+            # --int8_base: 凍結したベース重みは int8（64 要素ごとに bf16 の scale で 1 + 2/64 バイト）。ブロックの重みはほぼ全て Linear
+            weight_bytes = 1.04
         ds = train_dataset_group.datasets[0] if getattr(train_dataset_group, "datasets", None) else None
         pixels = (ds.width * ds.height) if ds is not None and getattr(ds, "width", None) else vram_budget.BASE_PIXELS
         result = vram_budget.plan_for_dit_file(
