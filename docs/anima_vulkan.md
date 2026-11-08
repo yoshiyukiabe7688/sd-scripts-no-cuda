@@ -166,11 +166,28 @@ Python 環境は Windows と同じで、PyTorch の CPU 版（2.8.0+cpu）と `r
 GPU 使用率 100%、温度 77〜79°C、電力 25〜32W。CPU 使用率は 0〜3%、RAM は 9〜21GB。
 GPU メモリが 96% に迫る構成（512px など）では、特定の step が極端に遅くなる事例を 1 度だけ観測しています（原因は未特定）。余裕を見て、384px 以下を勧めます。
 
+## 融合アテンション（自動）
+`F.scaled_dot_product_attention` は、vk では融合カーネル（flash attention 型）で実行されます。QK^T の logits を fp32 のまま保持し、N x N の score 行列をメモリに作りません（forward と backward の両方）。
+学習スクリプトの変更は要りません。
+
+- **協調行列が使える GPU（RX 9070 XT など、bf16 / f16）は常に融合版**を使います。従来の bmm + softmax より速く、メモリも少なくなります（RX 9070 XT、bf16、fwd+bwd）:
+
+| 形 | 従来 | 融合 | ピークメモリ |
+|---|---|---|---|
+| Anima 型（16 heads、S=1024、D=128） | 3.65 ms | 1.55 ms | 236 → 48 MiB |
+| SD1.5 型（8 heads、S=4096、D=40） | 92.8 ms | 3.9 ms | 1564 → 32 MiB |
+
+  Anima の実学習（500 step）は 440 秒で完走し、学習した LoRA で人物が再現されることを sd.cpp で確認しました。
+- **協調行列の無い GPU（RX 550 など）は、score 行列が大きい（256 MiB 以上。SD1.5・SDXL の 512px など）ときだけ**融合版（スカラー版）を使います。従来より遅い（SD1.5 で約 20%）代わりにメモリが大きく減ります（RX 550 の SD1.5: VRAM 最大 3933 → 2650 MB。4GB の 96% に達していたのが下がります）。score 行列が小さいとき（Anima の 512px など）は従来経路です。
+- 対応は 4 次元 [B,H,S,D]、D <= 128、f32 / bf16 / f16、マスク・dropout・causal 無しです。それ以外（Anima の LLM アダプタのマスク付き attention、D > 128 など）は従来の経路で動きます。
+- **精度**: 実 Anima の attention の入力で比べると、出力と勾配の誤差は従来経路・CPU の bf16 と同水準（0.3〜1%）です。**精度の改善策ではありません**。モデル全体の LoRA 勾配の誤差は、bf16 逆伝播の不安定さで大きく揺れ（相対誤差が入力によって 0.2〜3）、融合版も同じ揺れの範囲です。
+
 ## 環境変数
 | 変数 | 意味 |
 |---|---|
 | `SD_SCRIPTS_BACKEND=vk` | 外部バックエンド `vk` を使う（`library/device_utils.py`）。未指定なら従来どおり CUDA/XPU/MPS/CPU |
 | `VKT_NO_COOP=1` | 協調行列カーネルを使わない（タイル型 GEMM のみ。速度は落ちるが、勾配の丸め誤差の挙動が CPU に近い） |
+| `VKT_FUSED_ATTN=0/1` | 融合アテンション（`F.scaled_dot_product_attention` の vk 実装）を使わない（0）／常に使う（1）。未指定は auto（下の節）。`VKT_NO_FUSED_ATTN=1` は 0 と同じ |
 | `VKT_STATS=1` | 終了時に dispatch/転送/フォールバックの時間と回数を表示 |
 | `VKT_TRACE_FALLBACK=1` | CPU フォールバックした演算の引数と、vk と CPU の混在を表示（デバッグ用） |
 | `VKRT_PROFILE=1` | カーネル別の GPU 時間を計測（1 dispatch ごとに同期するので遅くなる） |
