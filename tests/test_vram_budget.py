@@ -74,3 +74,21 @@ def test_plan_for_dit_file_returns_none_for_unreadable_file(tmp_path):
     bad = tmp_path / "bad.safetensors"
     bad.write_bytes(b"not a safetensors file")
     assert vb.plan_for_dit_file(str(bad), 3072, weight_bytes_per_element=2, network_dim=16, pixels=512 * 512) is None
+
+
+def test_int8_base_weight_estimate_reduces_swapped_blocks(tmp_path):
+    # --int8_base ではブロックの重みが約半分（1.04 バイト/要素）なので、同じ予算でスワップするブロックが減る
+    import torch
+    from safetensors.torch import save_file
+
+    path = tmp_path / "dit.safetensors"
+    tensors = {}
+    for i in range(28):
+        tensors[f"net.blocks.{i}.a.weight"] = torch.zeros(2048, 2048, dtype=torch.bfloat16)
+        tensors[f"net.blocks.{i}.b.weight"] = torch.zeros(2048, 4096, dtype=torch.bfloat16)
+    save_file(tensors, str(path))
+    kw = dict(network_dim=16, pixels=512 * 512)
+    bf16 = vb.plan_for_dit_file(str(path), 1024, weight_bytes_per_element=2, **kw)
+    int8 = vb.plan_for_dit_file(str(path), 1024, weight_bytes_per_element=1.04, **kw)
+    assert bf16 is not None and int8 is not None
+    assert int8.blocks_to_swap < bf16.blocks_to_swap

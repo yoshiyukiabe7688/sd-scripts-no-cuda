@@ -38,7 +38,7 @@ class VramPlan:
     reason: str
 
 
-def read_safetensors_sizes(path: str, bytes_per_element: int) -> Dict[str, int]:
+def read_safetensors_sizes(path: str, bytes_per_element: float) -> Dict[str, int]:
     """safetensors のヘッダだけを読み、テンソル名 -> 学習時のバイト数（`bytes_per_element` で換算）を返す。重みは読まない。"""
     with open(path, "rb") as f:
         (header_len,) = struct.unpack("<Q", f.read(8))
@@ -50,7 +50,7 @@ def read_safetensors_sizes(path: str, bytes_per_element: int) -> Dict[str, int]:
         numel = 1
         for d in info["shape"]:
             numel *= d
-        sizes[name] = numel * bytes_per_element
+        sizes[name] = int(numel * bytes_per_element)
     return sizes
 
 
@@ -107,7 +107,7 @@ def plan_for_dit_file(
     path: str,
     budget_mib: float,
     *,
-    weight_bytes_per_element: int,
+    weight_bytes_per_element: float,
     network_dim: int,
     pixels: int,
     ring_size: int = 2,
