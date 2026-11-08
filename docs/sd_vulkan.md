@@ -59,6 +59,12 @@ python sdxl_train_network.py ... --int8_base
 - `--int8_base_skip <正規表現>` で、特定のモジュール名だけ元の dtype のまま残せます。通常（交換型）のブロックスワップ（`--blocks_to_swap`）とは併用できません。Anima と `--vram_budget_mb` の併用は [anima_vulkan.md](anima_vulkan.md) を参照してください。
 - `--blocks_to_swap` / `--vram_budget_mb` を SDXL・SD1.5 に付けた検証はしていません（UNet 系のスワップ対応は未確認）。
 
+## 融合アテンション（自動）
+`F.scaled_dot_product_attention`（`--sdpa`）は、vk では融合カーネルで実行されます。詳細・方針・速度は [anima_vulkan.md](anima_vulkan.md) の「融合アテンション」を参照してください。
+- RX 9070 XT（協調行列あり）は常に融合版。SD1.5 型（8 heads、S=4096、D=40）の fwd+bwd が 92.8 → 3.9 ms、ピークメモリ 1564 → 32 MiB。
+- RX 550（協調行列なし）は SD1.5 の 512px で自動的に融合版（スカラー版）になり、VRAM 最大 3933 → 2650 MB、速度は 9.25 → 11.15 秒/step（約 20% 低下）。
+- D > 128 の attention（SD1.5 の 1280 チャネル段、D=160）は従来の経路です。
+
 ## 実装の概要（torch-vulkan 側）
 SD1.5 / SDXL の UNet が学習で使う演算のうち、Anima で未実装だったのは 3 系統だけです（46 種の ATen 演算のうち）。
 - **conv2d**（forward / backward）: im2col + 既存の行列積（協調行列 / タイル型）。NCHW・groups=1・dilation=1。1x1・stride 1 は im2col を省く。ベース重みは凍結なので、backward は入力の勾配が中心。重みの勾配は LoRA の 1x1 conv だけ。
