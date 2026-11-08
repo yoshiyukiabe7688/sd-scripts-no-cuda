@@ -38,6 +38,7 @@ from library.dreambooth_dataset import DreamBoothDataset
 from library.model_io import SS_METADATA_MINIMUM_KEYS
 import library.logging_util as logging_util
 import library.loss as loss_util
+import library.int8_weights as int8_weights
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.config_util as config_util
@@ -1018,6 +1019,7 @@ class NetworkTrainer:
 
         # load target models: unet may be None for lazy loading
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+        int8_weights.apply_from_args(args, unet)  # --int8_base: 凍結したベース重みを int8 で保持する（library/int8_weights.py）
         if vae_dtype is None:
             vae_dtype = vae.dtype
             logger.info(f"vae_dtype is set to {vae_dtype} by the model since cast_vae() is false")
@@ -1055,6 +1057,7 @@ class NetworkTrainer:
         if unet is None:
             # lazy load unet if needed. text encoders may be freed or replaced with dummy models for saving memory
             unet, text_encoders = self.load_unet_lazily(args, weight_dtype, accelerator, text_encoders)
+            int8_weights.apply_from_args(args, unet)  # Anima はブロックスワップの都合で load_unet_lazily 内でも適用済み（冪等）
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
@@ -1938,6 +1941,18 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--network_train_unet_only", action="store_true", help="only training U-Net part / U-Net関連部分のみ学習する"
+    )
+    parser.add_argument(
+        "--int8_base",
+        action="store_true",
+        help="keep the frozen base Linear/Conv2d weights of the U-Net/DiT as int8 (64-element block scales) to save memory; LoRA stays in the training dtype"
+        " / 凍結したベースの Linear/Conv2d の重みを int8（64 要素ごとの scale）で保持してメモリを減らす（LoRA は通常の dtype のまま）",
+    )
+    parser.add_argument(
+        "--int8_base_skip",
+        type=str,
+        default=None,
+        help="regex of module names to keep in the original dtype with --int8_base / --int8_base 時に元の dtype のまま残すモジュール名の正規表現",
     )
     parser.add_argument(
         "--network_train_text_encoder_only",

@@ -26,6 +26,7 @@ from library import (
 )
 import library.args as args_util
 import library.compile_utils as compile_utils
+import library.int8_weights as int8_weights
 import library.model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
 import train_network
@@ -178,7 +179,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, list[nn.Module]]:
         loading_dtype = None if args.fp8_scaled else weight_dtype
-        loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
+        # --int8_base は CPU で読み込んで量子化してからデバイスへ移す（bf16 の全重みを先にデバイスへ載せない）
+        loading_device = "cpu" if (self.is_swapping_blocks or getattr(args, "int8_base", False)) else accelerator.device
 
         attn_mode = "torch"
         if args.xformers:
@@ -197,6 +199,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             loading_dtype,
             args.fp8_scaled,
         )
+
+        # --int8_base: ブロックスワップの offloader が swap 対象のテンソルを生成時に集めるので、enable_block_swap の前に int8 化する
+        int8_weights.apply_from_args(args, model)
 
         # Store unsloth preference so that when the base NetworkTrainer calls
         # dit.enable_gradient_checkpointing(cpu_offload=...), we can override to use unsloth.

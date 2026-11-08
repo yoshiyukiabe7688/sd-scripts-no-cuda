@@ -9,6 +9,7 @@ from typing import Any, Optional, Union, Callable, Tuple
 import torch
 import torch.nn as nn
 
+from library.int8_weights import _Int8Mixin
 from library.utils import setup_logging
 
 setup_logging()
@@ -420,7 +421,11 @@ def default_swap_tensor_selector(block: nn.Module) -> list[tuple[nn.Module, str]
     """
     jobs = []
     for _, module in block.named_modules():
-        if hasattr(module, "weight") and module.weight is not None and module.__class__.__name__.endswith("Linear"):
+        if isinstance(module, _Int8Mixin):
+            # --int8_base: int8 の重み `q` と、ブロックごとの scale（どちらも persistent=False の buffer）を一緒に流す
+            jobs.append((module, "q"))
+            jobs.append((module, "scale"))
+        elif hasattr(module, "weight") and module.weight is not None and module.__class__.__name__.endswith("Linear"):
             jobs.append((module, "weight"))
     return jobs
 
@@ -515,6 +520,13 @@ def create_offloader(block_type: str, blocks: list[nn.Module], num_blocks: int, 
             debug=config.debug,
         )
     # classic exchange offloader. `use_pinned_memory` is not used by this implementation.
+    if config.device.type != "cpu" and any(isinstance(m, _Int8Mixin) for b in blocks for m in b.modules()):
+        raise ValueError(
+            "--int8_base cannot be combined with the generic block swap (it swaps `weight` parameters only). Use"
+            " --block_swap_h2d_only (frozen-base LoRA training; streams the int8 weights and their scales), or drop --blocks_to_swap."
+            " / --int8_base は通常のブロックスワップ（`weight` パラメータだけを交換する）と併用できません。--block_swap_h2d_only"
+            "（int8 の重みと scale を流す）を使うか、--blocks_to_swap を外してください。"
+        )
     return ModelOffloader(blocks, blocks_to_swap, config.device, supports_backward=config.supports_backward, debug=config.debug)
 
 
