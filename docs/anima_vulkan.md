@@ -10,9 +10,20 @@ CPU のみでも学習できます（環境変数なし。bf16 で約 10 秒/ste
 - Anima-base v1.0 と Anima-Turbo v1.1 の LoRA 学習（512px、batch 1、bf16、rank 16）: **約 1.4 秒/step**（CPU bf16 の約 7 倍）。
 - 学習した LoRA を **stable-diffusion.cpp**（master-1053-5a1ba5d、Vulkan ビルド）で読み込んで生成できることを確認済み（840/840 テンソルが適用）。
   オリジナルキャラクター（銀髪ツインテール・赤いリボン・青い目）を 12 枚で学習し、トリガーワード付きの未学習の場面で、LoRA ありはキャラクターが再現され、なしでは再現されない。base と Turbo の両方で確認。
+- Linux（Ubuntu、Mesa RADV）/ **Radeon RX 550 4GB**（Polaris。fp16 演算・協調行列なし）: Anima-base の LoRA 学習（384px、300 step、`--blocks_to_swap 24`）が完走し、
+  生成した人物 LoRA でも同様にキャラクターが再現されることを確認（詳細は「古い GPU 向けの調整」）。
+- Windows 11 / **Radeon RX 640**（Polaris 23、4GB、AMD 公式ドライバ 26.5.2、Vulkan 1.3.260。fp16 演算・協調行列なし）: 384px・8 step の学習が完走
+  （`--blocks_to_swap 24` で約 22 秒/step、`--vram_budget_mb` 指定または auto で約 19 秒/step）。
+  このドライバは `maxPushConstantsSize` に 128 バイト（Vulkan の保証最小値）を報告するため、要素演算の push constant を 128 バイトに収めている。
+- Windows 11 / **Intel Arc 140V**（内蔵、メモリ共有、協調行列の拡張はあるがカーネルが使う形が無いのでタイル型）: 384px・8 step の学習が完走（スワップなしで約 12.7 秒/step）。
+  `VKRT_DEVICE=Arc`（番号か名前の一部）で使うデバイスを選ぶ（未指定なら最初の dGPU）。
+- **実機で確認したのは上の 4 機種だけ**です。それ以外の GPU（NVIDIA を含む）は未検証です。RX 640 と Arc の確認は 384px・8 step までで、300 step の学習と、生成した人物 LoRA の確認はしていません。
 
 ## 必要なもの
-- Vulkan 対応 GPU とドライバ。協調行列（`VK_KHR_cooperative_matrix`）があると行列積が速くなる（無ければ自動でタイル型 GEMM に切り替わる）。
+- Vulkan 対応 GPU とドライバ。次の機能が必須です（無いデバイスでは起動時に、足りない機能名つきのエラーになります）:
+  `bufferDeviceAddress`、`shaderInt64`、`shaderInt16`、`shaderInt8`、`storageBuffer8BitAccess`、`storageBuffer16BitAccess`。
+  `maxPushConstantsSize` は 128 バイト以上（Vulkan の保証最小値）。
+  fp16 演算（`shaderFloat16`）と協調行列（`VK_KHR_cooperative_matrix`。カーネルが使う 16x16x16 の形があるときだけ有効）は任意です。協調行列があると行列積が速くなります（無ければ自動でタイル型 GEMM に切り替わる）。
 - `torch-vulkan` のビルド: Visual Studio 2022（MSVC）、Rust（cargo）、Vulkan SDK（シェーダを再生成する場合のみ。生成済み SPIR-V はコミット済み）。
 - `torch-vulkan` は sd-scripts とは別リポジトリです。<https://github.com/yoshiyukiabe7688/torch-vulkan> を任意の場所に clone してください（例: `C:\Users\<you>\dev\torch-vulkan`）。
 
@@ -55,9 +66,9 @@ python anima_train_network.py ... --vram_budget_mb auto     # デバイスが報
 | なし（16GB） | 0（チェックポイントも無し） | 約 9.0GB | 約 1.06 秒/step |
 | 3072 MiB | 15 | 約 2.7GB | 約 1.9 秒/step |
 | 2048 MiB | 23 | 約 1.65GB | 約 2.0 秒/step |
-| 1536 MiB | 26（上限） | 約 1.3GB | 約 1.9 秒/step |
+| 1536 MiB | 26（上限） | 上限を強制すると、実学習では確保に失敗する（スラブ内の断片化）。**未達** | — |
 
-- `vk` で数値を指定したときは、その値を**上限として強制**します（超えると OOM）。大きい GPU で小さい GPU を模擬して、収まるかを試すのに使えます。
+- `vk` で数値を指定したときは、その値を**上限として強制**します（超えると OOM）。1536 MiB のように、収めるのが厳しい上限では、断片化で確保に失敗することがあります。2048 MiB 以上で確認しています。大きい GPU で小さい GPU を模擬して、収まるかを試すのに使えます。
   `auto` は強制しません（OS が許す予算を VK_EXT_memory_budget で取得して決めるだけ）。
 - `--blocks_to_swap` を自分で指定したときは `--vram_budget_mb` は無視されます。`--cpu_offload_checkpointing` / `--unsloth_offload_checkpointing` とは併用できません。
 - 見積もりは 512px・rank 16 の実測を元にしています（解像度と rank に応じて補正）。余裕を持たせてあるので、OOM になる場合は予算を下げてください。
@@ -111,7 +122,7 @@ Anima の DiT は画像をトークンに分割して処理するので、トー
 `--max_train_steps` で自由に調整できます。時間が足りないときは、step 数を減らすより先に解像度を下げてください。
 
 ### 必須の設定
-- **`--blocks_to_swap 24` を付ける。** Anima の重み（約 4GB）は 4GB の GPU に載らないので、ブロックを CPU に置き、使うときだけ GPU に転送します。
+- **`--blocks_to_swap 24` を付ける**（RX 550 で検証した設定）。`--vram_budget_mb`（前の節）でも同様のスワップを自動で決められます。RX 550 では 3072 MiB で 4 step、RX 640 では 3072 / 2048 / auto で 6〜8 step が完走しました（RX 640 では `--blocks_to_swap 24` より速い）。 Anima の重み（約 4GB）は 4GB の GPU に載らないので、ブロックを CPU に置き、使うときだけ GPU に転送します。
   CUDA 以外では、この指定は自動で通常のスワップ（凍結重みを CPU の原本から転送するだけで、書き戻しはしない方式）になります。
 - `--gradient_checkpointing` を併用する（活性化を約 5GB → 0.3GB に減らす）。
 - LoRA の `--network_dim` は 16 のまま。これを上げると GPU メモリと時間が増えます。
@@ -142,9 +153,11 @@ GPU メモリが 96% に迫る構成（512px など）では、特定の step �
 | `VKT_TRACE_FALLBACK=1` | CPU フォールバックした演算の引数と、vk と CPU の混在を表示（デバッグ用） |
 | `VKRT_PROFILE=1` | カーネル別の GPU 時間を計測（1 dispatch ごとに同期するので遅くなる） |
 | `VKRT_VALIDATION=1` | Vulkan 検証レイヤを有効にする（開発用） |
+| `VKRT_DEVICE=<番号 or 名前の一部>` | 使う Vulkan デバイスを選ぶ（例: `VKRT_DEVICE=Arc`）。未指定なら最初の dGPU。一致しなければ利用可能なデバイス一覧つきのエラー |
 | `VKT_MEM_LIMIT_MB=N` | GPU メモリの使用量に上限（MiB）を設け、小さい VRAM の GPU を模擬する（`--vram_budget_mb N` を指定すると自動で設定される） |
 
 ## 制限・注意
+- **Windows の AMD 公式ドライバ（RX 640 で確認）では、fp16 の値が正しく返らない**（仮数部を失う。原因は未特定）。Anima の学習は bf16 なので影響しませんが、fp16 を使う設定（`--mixed_precision=fp16` など）は使わないでください。
 - **GPU で動くのは DiT の学習（fwd/bwd）とオプティマイザ**です。VAE のエンコード・デコード（畳み込み）とテキストエンコーダは CPU で動きます。
   学習中のサンプル画像生成（`--sample_every_n_steps`）は動作しますが、VAE デコードが CPU のため遅くなります。
 - bf16 の勾配には、CPU bf16 でも出る程度の丸め誤差があります（前半ブロックの LoRA 勾配は fp32 基準に対して相対 L2 誤差 0.3〜0.5 程度）。
